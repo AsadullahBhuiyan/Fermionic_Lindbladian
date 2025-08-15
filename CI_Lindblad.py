@@ -79,103 +79,95 @@ class CI_Lindblad:
             -n_mag - nz - nx + 1j*ny
         )
 
-        G0 = np.zeros(Nx, Nx, 2, Nx, Ny, 2)
-
-        self.G_list = []
-        self.G_list.append(G0)
-
-        def make_V(W):
-            V = np.einsum('ijklm, pqrlm -> ijkpqr', W, W.conj(), optimize=True) # sum over Wannier centers 
-            return V
         
-        def Lgain(G):
-            '''
-            G in (Nx, Ny, 2, Nx, Ny, 2)
-            '''
-            V_A_minus = make_V(self.W_A_minus)
-            V_B_minus = make_V(self.W_B_minus)
-            V = V_A_minus + V_B_minus #sum over local orbital choices
+        self.G = np.zeros(Nx, Nx, 2, Nx, Ny, 2)
 
-            Y = -(1/2)*(np.einsum('ijklmn, lmnpqr -> ijkpqr', G, V, optimize=True) + np.einsum('ijklmn, lmnpqr -> ijkpqr', V, G, optimize=True))   
-            return self.n_a*(V + Y)
+        if G_history:
+            self.G_list = []
+            self.G_list.append(self.G)
+
+    def make_V(self, W):
+        V = np.einsum('ijklm, pqrlm -> ijkpqr', W, W.conj(), optimize=True) # sum over Wannier centers 
+        return V
+    
+    def Lgain(self, G):
+        '''
+        G in (Nx, Ny, 2, Nx, Ny, 2)
+        '''
+        V_A_minus = self.make_V(self.W_A_minus)
+        V_B_minus = self.make_V(self.W_B_minus)
+        V = V_A_minus + V_B_minus #sum over local orbital choices
+        Y = -(1/2)*(np.einsum('ijklmn, lmnpqr -> ijkpqr', G, V, optimize=True) + np.einsum('ijklmn, lmnpqr -> ijkpqr', V, G, optimize=True))   
+        return self.n_a*(V + Y)
+    
+    def Lloss(self, G):
+        '''
+        G in (Nx, Ny, 2, Nx, Ny, 2)            
+        '''
+        V_A_plus = self.make_V(self.W_A_plus)
+        V_B_plus = self.make_V(self.W_B_plus)
+        V = V_A_plus + V_B_plus #sum over local orbital choices
+        Y = -((1-self.n_a)/2)*(np.einsum('ijklmn, lmnpqr -> ijkpqr', G, V, optimize=True) + np.einsum('ijklmn, lmnpqr -> ijkpqr', V, G, optimize=True))   
+        return Y
+    
+    def double_comm(self, G, W):
+        '''
+        G in (Nx, Ny, 2, Nx, Ny, 2)
+        Summing over Wannier coordinates but not trial orbital choices
+        '''
+        linear_term = np.einsum('ijkab, lmnab, lmnpqr -> ijkpqr', W, W.conj(), G, optimize=True) + np.einsum('ijkab, lmnab, lmnpqr -> ijkpqr', G, W, W.conj(), optimize=True)
+        nonlinear_term = np.einsum('mnxab,pqyab,ijwab,ijwzkl,klzab -> mnxpqy', W, W.conj(), W.conj(), G, W, optimize=True)
+        Y = linear_term - 2*nonlinear_term
+        return Y
+    
+    def Ldecoh(self, G):
+        '''
+        G in (Nx, Ny, 2, Nx, Ny, 2)            
+        '''
+        upperband_term = self.double_comm(G, self.W_A_plus) + self.double_comm(G, self.W_B_plus)
+        lowerband_term = self.double_comm(G, self.W_A_minus) + self.double_comm(G, self.W_B_minus)
         
-        def Lloss(G):
-            '''
-            G in (Nx, Ny, 2, Nx, Ny, 2)            
-            '''
-            V_A_plus = make_V(self.W_A_plus)
-            V_B_plus = make_V(self.W_B_plus)
-            V = V_A_plus + V_B_plus #sum over local orbital choices
-
-            Y = -((1-self.n_a)/2)*(np.einsum('ijklmn, lmnpqr -> ijkpqr', G, V, optimize=True) + np.einsum('ijklmn, lmnpqr -> ijkpqr', V, G, optimize=True))   
-            return Y
+        Y = -(1/2)*((2-self.n_a)*lowerband_term + (1+self.n_a)*upperband_term)
+        return Y
+    
+    def Lcycle(self, G):
+        '''
+        G in (Nx, Ny, 2, Nx, Ny, 2)            
+        '''
+        Y = self.Lgain(G) + self.Lloss(G) + self.Ldecoh(G)
+        return Y
         
-        def double_comm(G, W):
-            '''
-            G in (Nx, Ny, 2, Nx, Ny, 2)
-            Summing over Wannier coordinates but not trial orbital choices
-            '''
-            linear_term = np.einsum('ijkab, lmnab, lmnpqr -> ijkpqr', W, W.conj(), G, optimize=True) + np.einsum('ijkab, lmnab, lmnpqr -> ijkpqr', G, W, W.conj(), optimize=True)
-            nonlinear_term = np.einsum('mnxab,pqyab,ijwab,ijwzkl,klzab -> mnxpqy', W, W.conj(), W.conj(), G, W, optimize=True)
-
-            Y = linear_term - 2*nonlinear_term
-
-            return Y
-        
-        def Ldecoh(G):
-            '''
-            G in (Nx, Ny, 2, Nx, Ny, 2)            
-            '''
-            upperband_term = double_comm(G, self.W_A_plus) + double_comm(G, self.W_B_plus)
-            lowerband_term = double_comm(G, self.W_A_minus) + double_comm(G, self.W_B_minus)
-            
-            Y = -(1/2)*((2-self.n_a)*lowerband_term + (1+self.n_a)*upperband_term)
-
-            return Y
-
-        def Lcycle(G):
-            '''
-            G in (Nx, Ny, 2, Nx, Ny, 2)            
-            '''
-            Y = Lgain(G) + Lloss(G) + Ldecoh(G)
-            return Y
-            
-        def rk4_step_inplace(G, dt, Lindblad = Lcycle, tmp=None):
-            """
-            In-place RK4 for G' = Lindblad(G). Returns G (updated).
-            tmp: optional dict of preallocated buffers {'k1','k2','k3','k4','Y'}
-            """
-            if tmp is None:
-                tmp = {}
-            k1 = tmp.get('k1'); k2 = tmp.get('k2'); k3 = tmp.get('k3'); k4 = tmp.get('k4'); Y = tmp.get('Y')
-            # allocate once with the right dtype/shape
-            if k1 is None: k1 = tmp['k1'] = np.empty_like(G)
-            if k2 is None: k2 = tmp['k2'] = np.empty_like(G)
-            if k3 is None: k3 = tmp['k3'] = np.empty_like(G)
-            if k4 is None: k4 = tmp['k4'] = np.empty_like(G)
-            if Y  is None: Y  = tmp['Y']  = np.empty_like(G)
-
-            # k1 = f(G)
-            k1[:] = Lindblad(G)
-
-            # k2 = f(G + dt/2 * k1)
-            np.multiply(k1, 0.5*dt, out=Y); np.add(G, Y, out=Y)
-            k2[:] = Lindblad(Y)
-
-            # k3 = f(G + dt/2 * k2)
-            np.multiply(k2, 0.5*dt, out=Y); np.add(G, Y, out=Y)
-            k3[:] = Lindblad(Y)
-
-            # k4 = f(G + dt * k3)
-            np.multiply(k3, dt, out=Y); np.add(G, Y, out=Y)
-            k4[:] = Lindblad(Y)
-
-            # G += dt/6 * (k1 + 2k2 + 2k3 + k4)
-            # Use Y as accumulator: Y = k1 + 2k2 + 2k3 + k4
-            np.add(k1, k4, out=Y)
-            np.add(Y, 2.0*k2, out=Y)
-            np.add(Y, 2.0*k3, out=Y)
-            G += (dt/6.0) * Y
-            return G, tmp
+    def rk4_step_inplace(self, G, dt, tmp=None):
+        """
+        In-place RK4 for G' = Lindblad(G). Returns G (updated).
+        tmp: optional dict of preallocated buffers {'k1','k2','k3','k4','Y'}
+        """
+        if tmp is None:
+            tmp = {}
+        k1 = tmp.get('k1'); k2 = tmp.get('k2'); k3 = tmp.get('k3'); k4 = tmp.get('k4'); Y = tmp.get('Y')
+        # allocate once with the right dtype/shape
+        if k1 is None: k1 = tmp['k1'] = np.empty_like(G)
+        if k2 is None: k2 = tmp['k2'] = np.empty_like(G)
+        if k3 is None: k3 = tmp['k3'] = np.empty_like(G)
+        if k4 is None: k4 = tmp['k4'] = np.empty_like(G)
+        if Y  is None: Y  = tmp['Y']  = np.empty_like(G)
+        # k1 = f(G)
+        k1[:] = self.Lcycle(G)
+        # k2 = f(G + dt/2 * k1)
+        np.multiply(k1, 0.5*dt, out=Y); np.add(G, Y, out=Y)
+        k2[:] = self.Lcycle(Y)
+        # k3 = f(G + dt/2 * k2)
+        np.multiply(k2, 0.5*dt, out=Y); np.add(G, Y, out=Y)
+        k3[:] = self.Lcycle(Y)
+        # k4 = f(G + dt * k3)
+        np.multiply(k3, dt, out=Y); np.add(G, Y, out=Y)
+        k4[:] = self.Lcycle(Y)
+        # G += dt/6 * (k1 + 2k2 + 2k3 + k4)
+        # Use Y as accumulator: Y = k1 + 2k2 + 2k3 + k4
+        np.add(k1, k4, out=Y)
+        np.add(Y, 2.0*k2, out=Y)
+        np.add(Y, 2.0*k3, out=Y)
+        G += (dt/6.0) * Y
+        return G, tmp
         
 
