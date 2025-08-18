@@ -3,6 +3,7 @@ import math
 import time
 from IPython.display import clear_output
 from matplotlib import pyplot as plt
+import os
 
 class CI_Lindblad:
     def __init__(self, Nx, Ny, decoh = True, alpha = 1.0):
@@ -643,6 +644,12 @@ class CI_Lindblad:
     # -----------------------------
     # Plotting helpers
     # -----------------------------
+    def _ensure_outdir(self, subpath):
+        """Create (if needed) and return an output directory path under CWD.
+        subpath can include nested folders like 'figs/chern_dynamics'."""
+        outdir = os.path.join(os.getcwd(), subpath)
+        os.makedirs(outdir, exist_ok=True)
+        return outdir
     def plot_chern_dynamics_vs_time(self, N_list=(11, 21, 31), alpha=None,
                                     dt=5e-2, max_steps=500, filename=None):
         """
@@ -662,6 +669,7 @@ class CI_Lindblad:
             PDF filename to save. If None, a descriptive one is generated.
         """
         alpha_val = float(self.alpha if alpha is None else alpha)
+        outdir = self._ensure_outdir('figs/chern_dynamics')
 
         fig, ax = plt.subplots(figsize=(7, 4.5))
         marker_list = ['o', 'x', '*']
@@ -683,11 +691,17 @@ class CI_Lindblad:
 
         if filename is None:
             Ns = "-".join(str(n) for n in N_list)
-            filename = f"chern_dynamics_vs_time_alpha{alpha_val:g}_Ns{Ns}.pdf"
-        fig.savefig(filename, bbox_inches='tight')
+            if self.decoh:
+                filename = f"chern_dynamics_vs_time_alpha{alpha_val:g}_Ns{Ns}_decoh_on.pdf"
+            else:
+                filename = f"chern_dynamics_vs_time_alpha{alpha_val:g}_Ns{Ns}_decoh_off.pdf"
+        # Save to outdir (filename is just the basename, not a path)
+        fullpath = os.path.join(outdir, filename)
+        plt.tight_layout()
         plt.show()
+        fig.savefig(fullpath, bbox_inches='tight')
         plt.close(fig)
-        return filename
+        return fullpath
 
     def plot_steady_chern_vs_alpha(self, N_list=(11, 21, 31), alpha_list=None,
                                    dt=5e-2, max_steps=500, filename=None):
@@ -712,6 +726,7 @@ class CI_Lindblad:
         else:
             alphas = np.asarray(alpha_list, dtype=float)
 
+        outdir = self._ensure_outdir('figs/chern_vs_alpha')
         # Start total timing
         t_total_start = time.time()
 
@@ -750,69 +765,120 @@ class CI_Lindblad:
 
         if filename is None:
             Ns = "-".join(str(n) for n in N_list)
-            filename = f"chern_steady_vs_alpha_steps{int(max_steps)}_Ns{Ns}.pdf"
-        fig.savefig(filename, bbox_inches='tight')
-        plt.show()
-        plt.close(fig)
-        return filename
+            if self.decoh:
+                filename = f"chern_steady_vs_alpha_steps{int(max_steps)}_Ns{Ns}_decoh_on.pdf"
+            else:
+                filename = f"chern_steady_vs_alpha_steps{int(max_steps)}_Ns{Ns}_decoh_off.pdf"
 
-    def plot_squared_corr_vs_alpha(self, rx=0, ry=0, alpha_list=None,
+        fullpath = os.path.join(outdir, filename)
+        plt.tight_layout()
+        plt.show()
+        fig.savefig(fullpath, bbox_inches='tight')
+        plt.close(fig)
+        return fullpath
+
+    def plot_squared_corr_vs_alpha(self, direction='x', alpha_list=None,
                                    dt=5e-2, max_steps=500, filename=None):
         """
-        Plot steady-state squared two-point correlator C_G(rx, ry) vs alpha for
-        the *current* lattice size (self.Nx,self.Ny).
+        Plot 1D squared correlator C(r) vs r along a chosen path, overlaying
+        curves for multiple alpha values.
+
+        Direction options
+        -----------------
+        direction='x'   : use separations (r, 0) with r = 0..Nx//2  → C(r) = C_G(r, 0)
+        direction='y'   : use separations (0, r) with r = 0..Ny//2  → C(r) = C_G(0, r)
+        direction='diag': use separations (r, r) with r = 0..min(Nx,Ny)//2 → C(r) = C_G(r, r)
 
         Parameters
         ----------
-        rx, ry : int
-            Separation components.
+        direction : {'x','y','diag'}
+            Which path in (r_x,r_y) to plot along.
         alpha_list : iterable of float, optional
-            Sequence of alpha values. If None, defaults to linspace(-4, 4, 161).
+            Sequence of alpha values. If None, defaults to linspace(-4,4,161).
         dt : float
             RK4 time step.
         max_steps : int
-            Number of steps (default 500).
+            Number of steps for steady-state approximation.
         filename : str or None
-            PDF filename to save. If None, a descriptive one is generated.
+            Basename of the PDF to save. If None, a descriptive name is generated
+            that reflects the chosen direction and r-range.
+
+        Returns
+        -------
+        fullpath : str
+            Full path to the saved PDF.
         """
+        # Alphas to compare
         if alpha_list is None:
             alphas = np.linspace(-4.0, 4.0, 161)
         else:
             alphas = np.asarray(alpha_list, dtype=float)
 
+        if direction not in ('x', 'y', 'diag'):
+            raise ValueError("direction must be 'x', 'y', or 'diag'")
+
         Nx, Ny = int(self.Nx), int(self.Ny)
-        rx_arr = np.atleast_1d(rx)
-        ry_arr = np.atleast_1d(ry)
-        averaged = (rx_arr.size > 1) or (ry_arr.size > 1)
+        if direction == 'x':
+            r_vals = np.arange(0, Nx//2 + 1, dtype=int)  # r = |rx|
+            rx_arr = r_vals
+            ry_arr = np.array([0], dtype=int)
+            ylabel = r"$C_G(r, 0)$"
+            title_dir = 'x'
+        elif direction == 'y':
+            r_vals = np.arange(0, Ny//2 + 1, dtype=int)  # r = |ry|
+            rx_arr = np.array([0], dtype=int)
+            ry_arr = r_vals
+            ylabel = r"$C_G(0, r)$"
+            title_dir = 'y'
+        else:  # 'diag'
+            rmax = min(Nx, Ny)//2
+            r_vals = np.arange(0, rmax + 1, dtype=int)  # r = |rx| = |ry|
+            rx_arr = r_vals
+            ry_arr = r_vals
+            ylabel = r"$C_G(r, r)$"
+            title_dir = 'diag'
+
+        outdir = self._ensure_outdir('figs/corr_vs_r')
 
         fig, ax = plt.subplots(figsize=(7, 4.5))
-
-        Cvals = []
         for a in alphas:
             solver = CI_Lindblad(Nx=Nx, Ny=Ny, decoh=self.decoh, alpha=a)
             G_final, _ = solver.G_evolution(max_steps=int(max_steps), dt=dt, keep_history=False)
-            C = solver.squared_two_point_corr(G_final, rx=rx, ry=ry)
-            C = np.asarray(C, dtype=float)
-            # Reduce to a scalar per alpha if a grid was requested
-            Cvals.append(C.mean() if C.ndim > 0 else float(C))
+            C_grid = solver.squared_two_point_corr(G_final, rx=rx_arr, ry=ry_arr)
 
-        Cvals = np.asarray(Cvals, dtype=float)
-        ax.plot(alphas, Cvals, marker='o', ms=3, lw=1)
-        ax.set_xlabel(r"$\alpha$")
-        if averaged:
-            ax.set_ylabel(fr"$\langle C_G \rangle$ over rx,ry grid")
-        else:
-            ax.set_ylabel(fr"$C_G(r_x={rx}, r_y={ry})$")
-        if averaged:
-            ax.set_title(f"Steady-state |G|^2 vs $\\alpha$ (avg over rx,ry grid)")
-        else:
-            ax.set_title(f"Steady-state |G|^2 vs $\\alpha$ at separation (rx,ry)=({rx},{ry})")
+            if direction == 'diag':
+                # C_grid has shape (len(r), len(r)); take the diagonal entries
+                L = r_vals.size
+                C_vec = C_grid[np.arange(L), np.arange(L)].astype(float)
+            else:
+                # C_grid is (len(r),1) or (1,len(r)); flatten to vector of length len(r)
+                C_vec = C_grid.reshape(-1).astype(float)
+
+            ax.plot(r_vals, C_vec, marker='o', ms=3, lw=1, label=f"alpha={a:g}")
+
+        ax.set_xlabel(r"$r$")
+        ax.set_ylabel(ylabel)
+        ax.set_title(f"Steady-state |G|$^2$ vs r along {title_dir}-path (steps={int(max_steps)})")
+        ax.set_yscale('log')
         ax.grid(True, alpha=0.3)
+        ax.legend()
         plt.tight_layout()
 
+        # Build descriptive filename
         if filename is None:
-            filename = f"corr2_vs_alpha_N{Nx}_rx{rx}_ry{ry}_steps{int(max_steps)}.pdf"
-        fig.savefig(filename, bbox_inches='tight')
+            # Encode alpha list succinctly
+            if alphas.size <= 6:
+                a_desc = '-'.join(f"{v:g}" for v in alphas)
+            else:
+                a_desc = f"{alphas.size}vals_{alphas.min():g}to{alphas.max():g}"
+            r_desc = f"r0-{r_vals[-1]}"
+            if self.decoh:
+                filename = f"corr2_1D_vs_r_dir{title_dir}_N{Nx}_{r_desc}_alphas_{a_desc}_steps{int(max_steps)}_decoh_on.pdf"
+            else:
+                filename = f"corr2_1D_vs_r_dir{title_dir}_N{Nx}_{r_desc}_alphas_{a_desc}_steps{int(max_steps)}.pdf"
+
+        fullpath = os.path.join(outdir, filename)
         plt.show()
+        fig.savefig(fullpath, bbox_inches='tight')
         plt.close(fig)
-        return filename
+        return fullpath
