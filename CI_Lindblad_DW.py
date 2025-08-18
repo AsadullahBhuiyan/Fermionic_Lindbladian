@@ -4,7 +4,7 @@ import time
 from IPython.display import clear_output
 from matplotlib import pyplot as plt
 
-class CI_Lindblad:
+class CI_Lindblad_DW:
     def __init__(self, Nx, Ny, decoh = True, alpha = 1.0):
         """
         1) Build overcomplete Wannier spinors for a Chern insulator model.
@@ -57,7 +57,7 @@ class CI_Lindblad:
     
         print('Class CI_Lindblad has been Initialized')
 
-    def construct_OW_functions(self, alpha):
+    def construct_OW_functions(self, alpha, DW = True):
         '''
         Produces four fields:
           self.W_A_plus, self.W_B_plus, self.W_A_minus, self.W_B_minus,
@@ -65,7 +65,16 @@ class CI_Lindblad:
           (x, y, R_x, R_y, mu)
         and normalized per (R_x, R_y): sum_{x,y,mu} |W|^2 = 1.
         '''
-        self.alpha = alpha
+
+        if DW: 
+            # Create topological domain wall
+            alpha = np.empty((self.Nx, self.Ny), dtype = complex)
+            alpha[0:self.Nx//2, :] = 1
+            alpha[self.Nx//2:self.Nx+1, :] = 3
+        else:
+            alpha = np.ones((self.Nx, self.Ny))
+            
+            self.alpha = alpha
 
         # k-grids in radians per lattice spacing (FFT ordering)
         kx = 2*np.pi * np.fft.fftfreq(self.Nx, d=1.0)     # shape (Nx,)
@@ -73,9 +82,9 @@ class CI_Lindblad:
         KX, KY = np.meshgrid(kx, ky, indexing='ij')  # shape (Nx, Ny)
 
         # model vector n(k)
-        self.nx = np.sin(KX)
-        self.ny = np.sin(KY)
-        self.nz = alpha - np.cos(KX) - np.cos(KY)
+        self.nx = np.sin(KX)[:, :, None, None]
+        self.ny = np.sin(KY)[:, :, None, None]
+        self.nz = alpha[None, None, :, :] - np.cos(KX)[:, :, None, None] - np.cos(KY)[:, :, None, None]
         self.nmag = np.sqrt(self.nx**2 + self.ny**2 + self.nz**2)
         self.nmag = np.where(self.nmag == 0, 1e-15, self.nmag)  # avoid divide-by-zero
 
@@ -664,15 +673,14 @@ class CI_Lindblad:
         alpha_val = float(self.alpha if alpha is None else alpha)
 
         fig, ax = plt.subplots(figsize=(7, 4.5))
-        marker_list = ['o', 'x', '*']
-        for idx, N in enumerate(N_list):
+        for N in N_list:
             solver = CI_Lindblad(Nx=N, Ny=N, decoh=self.decoh, alpha=alpha_val)
             # Use the built-in chern-dynamics simulator (handles printing/progress)
             ts, ch, _, _ = solver.chern_dynamics_vs_time(alpha=alpha_val,
                                                          max_steps=int(max_steps),
                                                          keep_history=False)
             # ch is complex; plot real part. Scale ts by the requested dt for x-axis units
-            ax.plot(ts * dt, ch.real, label=f"N={N}", marker = marker_list[idx], markevery = int(1/dt))
+            ax.plot(ts * dt, ch.real, label=f"N={N}")
 
         ax.set_xlabel("t")
         ax.set_ylabel("real-space Chern number")
@@ -712,34 +720,14 @@ class CI_Lindblad:
         else:
             alphas = np.asarray(alpha_list, dtype=float)
 
-        # Start total timing
-        t_total_start = time.time()
-
         fig, ax = plt.subplots(figsize=(7, 4.5))
-        nN = len(N_list)
-        nA = len(alphas)
-        for iN, N in enumerate(N_list, start=1):
+        for N in N_list:
             ch_vals = []
-            N_start = time.time()
-            for ia, a in enumerate(alphas, start=1):
-                a_start = time.time()
+            for a in alphas:
                 solver = CI_Lindblad(Nx=N, Ny=N, decoh=self.decoh, alpha=a)
-                # Inner evolution prints per-iteration timing already via G_evolution
                 G_final, _ = solver.G_evolution(max_steps=int(max_steps), dt=dt, keep_history=False)
                 ch_vals.append(solver.real_space_chern_number(G_final).real)
-                # Alpha (inner outer-loop) progress line
-                alpha_iter_time = time.time() - a_start
-                total_elapsed   = time.time() - t_total_start
-                clear_output(wait=True)
-                print(
-                    f"[steady_vs_alpha] N_iter {iN}/{nN} | alpha_iter {ia}/{nA} | "
-                    f"alpha={a:g} | N={N} | alpha_itertime={alpha_iter_time:.3e}s | total={total_elapsed:.3e}s"
-                )
-            # Optionally, report per-N block duration
-            N_time = time.time() - N_start
-            # You can keep a summary print, or comment it if too chatty:
-            # print(f"[steady_vs_alpha] Completed N={N} in {N_time:.3e}s")
-            ax.plot(alphas, np.array(ch_vals), label=f"N={N}", marker = 'o')
+            ax.plot(alphas, np.array(ch_vals), label=f"N={N}")
 
         ax.set_xlabel(r"$\alpha$")
         ax.set_ylabel("real-space Chern number")
