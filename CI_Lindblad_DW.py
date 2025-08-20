@@ -1,11 +1,14 @@
 import numpy as np
 import math
 import time
+import os
+import matplotlib.animation as animation
 from IPython.display import clear_output
 from matplotlib import pyplot as plt
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
 class CI_Lindblad_DW:
-    def __init__(self, Nx, Ny, decoh = True):
+    def __init__(self, Nx, Ny, decoh=True, alpha_init=1.0, nshell=None, DW=True, dt_init=5e-2, max_steps_init=250, n_a_init=0.5, keep_history_init=True, G_init=None):
         """
         1) Build overcomplete Wannier spinors for a Chern insulator model.
 
@@ -14,6 +17,10 @@ class CI_Lindblad_DW:
         self.Nx, self.Ny = Nx, Ny
         self.decoh = decoh
         self.alpha = None
+        self.dt_default = float(dt_init)
+        self.max_steps_default = int(max_steps_init)
+        self.n_a_default = float(n_a_init)
+        self.keep_history_default = bool(keep_history_init)
 
         # --- Build tri-partition masks A, B, C inside a circle of radius R ---
         R = 0.4 * min(Nx, Ny)
@@ -53,8 +60,48 @@ class CI_Lindblad_DW:
         self.inside_mask = inside
         self.R = R
         self.ref = (xref, yref)
-    
-        print('Class CI_Lindblad has been Initialized')
+
+        print('Class CI_Lindblad_DW has been Initialized')
+
+        # --- Build overcomplete Wannier data; evolve only if not already cached ---
+        # Construct OW (may set a spatially varying alpha if DW=True)
+        self.construct_OW_functions(alpha_init, nshell=nshell, DW=DW)
+        # Only perform the initial evolution if we don't already have cached results
+        if not hasattr(self, "G_last") or self.G_last is None:
+            G_last, G_hist = self.G_evolution(max_steps=self.max_steps_default,
+                                              dt=self.dt_default,
+                                              G_init=G_init,
+                                              keep_history=self.keep_history_default)
+            self.G_last = G_last
+            self.G_history = G_hist
+
+    def _ensure_outdir(self, path):
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _ensure_OW_ready(self, alpha_hint=1.0):
+        """Ensure overcomplete Wannier (OW) structures exist before evolution.
+        If they are missing, build them with the provided alpha hint (default 1.0).
+        """
+        need = False
+        for attr in ("Pminus","Pplus","W_A_plus","W_B_plus","W_A_minus","W_B_minus",
+                     "V_A_plus","V_B_plus","V_A_minus","V_B_minus","V_plus","V_minus"):
+            if not hasattr(self, attr):
+                need = True
+                break
+        if need:
+            ah = float(alpha_hint if self.alpha is None else self.alpha)
+            self.construct_OW_functions(ah)
+
+    def _ensure_evolved(self):
+        """Ensure self.G_last / self.G_history exist (run one short evolution if missing)."""
+        if not hasattr(self, "G_last") or self.G_last is None:
+            G_last, G_hist = self.G_evolution(max_steps=self.max_steps_default,
+                                              dt=self.dt_default,
+                                              G_init=None,
+                                              keep_history=self.keep_history_default)
+            self.G_last = G_last
+            self.G_history = G_hist
 
     def construct_OW_functions(self, alpha, nshell = None, DW = True):
         '''
@@ -63,13 +110,27 @@ class CI_Lindblad_DW:
         each of shape (Nx, Ny, Nx, Ny, 2) with axes:
           (x, y, R_x, R_y, mu)
         and normalized per (R_x, R_y): sum_{x,y,mu} |W|^2 = 1.
+
+        If nshell is provided (integer), the real-space Wannier functions W are truncated
+        to a square window of size (2*nshell+1)×(2*nshell+1) centered at each (R_x, R_y)
+        using minimal-image (periodic) distances on the torus.
+        After truncation, W is renormalized per center such that
+        sum_{x,y,mu} |W|^2 = 1 for each (R_x, R_y); if the norm is zero for a center,
+        W remains zero for that center.
         '''
 
-        if DW: 
-            # Create topological domain wall
-            # Fill with the 'outside' value, then override the middle slab.
-            alpha = np.full((self.Nx, self.Ny), 3, dtype=complex)   # Chern = 0 region
-            alpha[self.Nx//4 : 3*self.Nx//4, :] = 1                 # Chern = 1 region
+        if DW:
+            # Create two domain walls: alpha = 1 in the central slab
+            # [Nx//2 - floor(0.2*Nx), Nx//2 + floor(0.2*Nx)] × [0, Ny)
+            # and alpha = 3 elsewhere.
+            alpha = np.full((self.Nx, self.Ny), 3, dtype=complex)  # outside slab (Chern=0)
+            half = self.Nx // 2
+            w = int(np.floor(0.2 * self.Nx))
+            x0 = max(0, half - w)
+            # Python slices are end-exclusive; include the right edge by +1, then clamp
+            x1 = min(self.Nx, half + w + 1)
+            alpha[x0:x1, :] = 1  # inside slab (Chern=1)
+            self.alpha = alpha
         else:
             alpha = np.ones((self.Nx, self.Ny))
             self.alpha = alpha
@@ -133,13 +194,43 @@ class CI_Lindblad_DW:
             W0 = k2_to_r2(F0)           # (Nx,Ny,Rx,Ry)
             W1 = k2_to_r2(F1)           # (Nx,Ny,Rx,Ry)
 
-            # Stack μ=0,1 as the 3rd axis → (Nx,Ny,2,Nx,Ny)
+            # Stack μ=0,1 as the 3rd axis → (Nx,Ny,2,Rx,Ry)
             W  = np.moveaxis(np.stack([W0, W1], axis=-1), -1, 2) # (Nx,Ny,2,Rx,Ry)
 
-            # Normalize per center (R_x,R_y) across (x,y,μ)
-            denom = np.sqrt(np.sum(np.abs(W)**2, axis=(0, 1, 2), keepdims=True)) + 1e-15
-            return W / denom
-
+            # --- Helper: construct a square window mask for truncation ---
+            def _square_window_mask(nshell):
+                # Returns mask of shape (Nx, Ny, Rx, Ry): True if (x,y) within window of nshell around (Rx,Ry)
+                Nx, Ny = self.Nx, self.Ny
+                x = np.arange(Nx)[:, None, None, None]  # (Nx,1,1,1)
+                y = np.arange(Ny)[None, :, None, None]  # (1,Ny,1,1)
+                Rx = np.arange(Nx)[None, None, :, None] # (1,1,Rx,1)
+                Ry = np.arange(Ny)[None, None, None, :] # (1,1,1,Ry)
+                dx_wrap = ((x - Rx + Nx//2) % Nx) - Nx//2  # (Nx,1,Rx,1)
+                dy_wrap = ((y - Ry + Ny//2) % Ny) - Ny//2  # (1,Ny,1,Ry)
+                mask = (np.abs(dx_wrap) <= nshell) & (np.abs(dy_wrap) <= nshell)  # (Nx,Ny,Rx,Ry)
+                return mask
+            
+            # If truncation is requested, apply window and renormalize per center
+            if nshell is not None:
+                mask = _square_window_mask(nshell)  # (Nx,Ny,Rx,Ry)
+                # Expand mask to (Nx,Ny,1,Rx,Ry) to match W (Nx,Ny,2,Rx,Ry)
+                mask_exp = mask[:, :, None, :, :]  # (Nx,Ny,1,Rx,Ry)
+                W = W * mask_exp  # (Nx,Ny,2,Rx,Ry)
+                # Compute norm per center (Rx,Ry), sum over (x,y,μ)
+                norm2 = np.sum(np.abs(W)**2, axis=(0, 1, 2), keepdims=True)  # (1,1,1,Rx,Ry)
+                # Avoid division by zero: only normalize where norm2 > 1e-15
+                norm_mask = (norm2 > 1e-15)
+                W_normed = np.zeros_like(W)
+                W_normed[..., :, :] = W  # default (will overwrite below)
+                # Only normalize where norm2 > 1e-15
+                W_normed = np.where(norm_mask, W / (np.sqrt(norm2) + 1e-15), W)
+                return W_normed
+            else:
+                # Normalize per center (R_x,R_y) across (x,y,μ)
+                denom = np.sqrt(np.sum(np.abs(W)**2, axis=(0, 1, 2), keepdims=True)) + 1e-15
+                return W / denom
+        
+        
         # Build the four overcomplete Wannier spinors for ALL centers: (Nx,Ny,2,Rx,Ry)
         self.W_A_plus  = make_W(self.Pplus,  tauA, phase)
         self.W_B_plus  = make_W(self.Pplus,  tauB, phase)
@@ -277,6 +368,9 @@ class CI_Lindblad_DW:
         """
         Nx, Ny = int(self.Nx), int(self.Ny)
 
+        # Make sure OW data (V_± etc.) are available before calling Lcycle
+        self._ensure_OW_ready(alpha_hint=1.0)
+
         # Initialize G
         if G_init is None:
             G = np.zeros((Nx, Ny, 2, Nx, Ny, 2), dtype=dtype)
@@ -299,15 +393,18 @@ class CI_Lindblad_DW:
                 G_history.append(G.copy())
             # live status line
             clear_output(wait=True)
-            print(f"[G_evolution] iter {step}/{int(max_steps)} | dt={dt:.3e} | itertime={iter_time:.3e}s | total={time.time()-t_start:.3e}s | alpha={self.alpha:g} | N=({self.Nx},{self.Ny})")
+            print(f"[G_evolution] iter {step}/{int(max_steps)} | dt={dt:.3e} | itertime={iter_time:.3e}s | total={time.time()-t_start:.3e}s | N=({self.Nx},{self.Ny})")
 
+        # Cache last and history for reuse
+        self.G_last = G
+        self.G_history = list(G_history) if keep_history else []
         return G, G_history
 
     # -----------------------------
     # Chern number 
     # -----------------------------
 
-    def real_space_chern_number(self, G, A_mask=None, B_mask=None, C_mask=None):
+    def real_space_chern_number(self, G=None, A_mask=None, B_mask=None, C_mask=None):
         """
         Compute the real-space Chern number using the projector built from G.
 
@@ -326,6 +423,9 @@ class CI_Lindblad_DW:
         complex
             12π i [ Tr(P_CA P_AB P_BC) - Tr(P_AC P_CB P_BA) ].
         """
+        if G is None:
+            self._ensure_evolved()
+            G = self.G_last
         Nx, Ny = int(self.Nx), int(self.Ny)
         expected = (Nx, Ny, 2, Nx, Ny, 2)
         if G.shape != expected:
@@ -366,7 +466,7 @@ class CI_Lindblad_DW:
         Y = 12 * np.pi * 1j * (t1 - t2)
         return np.real_if_close(Y, tol=1e-6)
 
-    def squared_two_point_corr(self, G, rx=0, ry=0):
+    def squared_two_point_corr(self, G=None, rx=0, ry=0):
         """
         Squared two-point correlator on a torus for separations r = (rx, ry).
 
@@ -391,6 +491,9 @@ class CI_Lindblad_DW:
         C : ndarray, shape (len(rx), len(ry))
             2D grid of squared two-point correlators for all (rx, ry) pairs.
         """
+        if G is None:
+            self._ensure_evolved()
+            G = self.G_last
         G = np.asarray(G)
         Nx, Ny, s1, Nx2, Ny2, s2 = G.shape
         if (s1, s2) != (2, 2) or (Nx, Ny) != (Nx2, Ny2):
@@ -417,6 +520,177 @@ class CI_Lindblad_DW:
         # Sum over r'=(x,y) and spins (mu, mu') → (Rx,Ry)
         C = np.sum(np.abs(blocks)**2, axis=(0, 1, 4, 5)) / (2.0 * Nx * Ny)
         return C
+
+
+    def squared_two_point_corr_xslice(self, G=None, x0=0, ry=0):
+        """
+        Squared two-point correlator along y for a fixed x = x0:
+
+            C_x0(ry) = (1 / (2 Ny)) * sum_{mu,mu', y'}
+                        | G[(x0,y',mu), (x0,y'+ry, mu')] |^2
+
+        Parameters
+        ----------
+        G  : ndarray, shape (Nx, Ny, 2, Nx, Ny, 2)
+        x0 : int
+            Fixed x-column at which to compute the correlator (mod Nx).
+        ry : int or array-like of int
+            y-separations. Scalars or 1D array.
+
+        Returns
+        -------
+        C : ndarray, shape (len(ry),)
+            Squared correlator vs ry at fixed x0.
+        """
+        if G is None:
+            self._ensure_evolved()
+            G = self.G_last
+        G = np.asarray(G)
+        Nx, Ny, s1, Nx2, Ny2, s2 = G.shape
+        if (s1, s2) != (2, 2) or (Nx, Ny) != (Nx2, Ny2):
+            raise ValueError("G must have shape (Nx, Ny, 2, Nx, Ny, 2).")
+        x0 = int(x0) % Nx
+
+        # y' grid and separations
+        Y = np.arange(Ny, dtype=np.intp)[:, None]        # (Ny, 1)
+        ry_arr = np.atleast_1d(ry).astype(np.intp)       # (R,)
+        R = ry_arr.size
+        Yp = (Y + ry_arr[None, :]) % Ny                  # (Ny, R)
+
+        # Extract the x0-column-to-x0-column block once: shape (Ny, 2, Ny, 2)
+        Gx = G[x0, :, :, x0, :, :]                       # (Ny, 2, Ny, 2)
+
+        # Reorder so the two y-axes are adjacent, then flatten (y, y') → flat index
+        # Gx_re has shape (Ny*Ny, 2, 2) where flat = y * Ny + y'
+        Gx_re = np.transpose(Gx, (0, 2, 1, 3)).reshape(Ny*Ny, 2, 2)
+
+        # Build flat indices for all (y, y+ry) pairs, then gather and reshape to (Ny, R, 2, 2)
+        flat_idx = (Y * Ny + Yp).reshape(-1)             # (Ny*R,)
+        blocks = Gx_re[flat_idx].reshape(Ny, R, 2, 2)    # (Ny, R, 2, 2)
+
+        # Average over y' and spins → (R,)
+        C = np.sum(np.abs(blocks)**2, axis=(0, 2, 3)) / (2.0 * Ny)
+        return C
+
+
+    def plot_corr_y_profiles(self, dt=5e-2, max_steps=500, n_a=0.5,
+                             x_positions=None, ry_max=None, filename=None):
+        """
+        Plot squared two-point correlation vs y-separation at several fixed x columns
+        chosen to probe the domain-wall geometry:
+          - deep in the topological bulk (alpha=1 slab center),
+          - deep in each trivial bulk (alpha=3) on left and right,
+          - at the left and right domain walls (interfaces).
+
+        If x_positions is provided, it should be a list of (x0, label) pairs to plot.
+
+        Parameters
+        ----------
+        dt, max_steps, n_a : evolution parameters passed to RK4 (if we evolve here).
+        x_positions : list[(int,str)] or None
+            Custom columns and labels. If None, choose sensible positions from DW geometry.
+        ry_max : int or None
+            Max y-separation r_y to plot; default Ny//2.
+        filename : str or None
+            PDF basename to save. If None, a descriptive name is generated.
+
+        Returns
+        -------
+        fullpath : str
+            Full path to the saved PDF.
+        """
+        Nx, Ny = int(self.Nx), int(self.Ny)
+
+        # Ensure Lindbladian ingredients exist
+        self._ensure_OW_ready(alpha_hint=1.0)
+
+        # Use cached steady-state
+        self._ensure_evolved()
+        G = self.G_last
+
+        # Default y-range
+        if ry_max is None:
+            ry_max = Ny // 2
+        ry_vals = np.arange(0, int(ry_max) + 1, dtype=int)
+
+        # Default x-positions from the domain-wall construction used in construct_OW_functions:
+        # central slab: x in [x0, x1) has alpha=1; outside is alpha=3
+        if x_positions is None:
+            #half = Nx // 2
+            #w = int(np.floor(0.2 * Nx))
+            #x0 = max(0, half - w)
+            #x1 = min(Nx, half + w + 1)  # end-exclusive
+
+            ## Representative columns
+            #x_topo   = (x0 + x1) // 2                        # deep inside topo slab
+            #x_triv_L = x0 // 2                               # middle of left trivial bulk
+            #x_triv_R = (x1 + Nx) // 2                        # middle of right trivial bulk
+            #x_wall_L = (x0 - 1) % Nx                         # just left of slab (interface)
+            #x_wall_R = x1 % Nx                               # just right of slab (interface)
+
+            #x_positions = [
+            #    (x_topo,   "topo bulk"),
+            #    (x_triv_L, "trivial (L)"),
+            #    (x_triv_R, "trivial (R)"),
+            #    (x_wall_L, "wall (L)"),
+            #    (x_wall_R, "wall (R)"),
+            #]
+            x_positions = np.arange(4, 16)
+
+        # Plot
+        outdir = self._ensure_outdir('figs/corr_y_profiles')
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+
+        # --- Add Chern marker inset ---
+        # Compute local Chern marker for inset
+        C_inset = self.local_chern_marker(G)
+        # Add an inset showing tanh C(r)
+        axins = inset_axes(ax, width="32%", height="40%", loc="upper right", borderpad=1.0)
+        im_in = axins.imshow(C_inset, cmap='RdBu_r', vmin=-1.0, vmax=1.0, origin='upper', aspect='equal')
+        # Show ticks and labels on the inset
+        axins.set_xlabel('y', fontsize=9)
+        axins.set_ylabel('x', fontsize=9)
+        axins.tick_params(axis='both', labelsize=8)
+        # Draw a light grid at lattice spacing to make the torus lattice visible
+        Nx, Ny = int(self.Nx), int(self.Ny)
+        axins.set_xticks(np.arange(-0.5, Ny, 1), minor=True)
+        axins.set_yticks(np.arange(-0.5, Nx, 1), minor=True)
+        axins.grid(which='minor', color='k', linewidth=0.2, alpha=0.25)
+        # Colorbar with legend text
+        cbar_in = fig.colorbar(im_in, ax=axins, fraction=0.046, pad=0.04)
+        cbar_in.set_label(r"$\tanh\mathcal{C}(\mathbf{r})$", fontsize=9)
+        cbar_in.ax.tick_params(labelsize=8)
+
+        # Plot correlation profiles
+        for x0 in x_positions:
+            C_vec = self.squared_two_point_corr_xslice(G, x0=int(x0), ry=ry_vals)
+            ax.plot(ry_vals, C_vec.real, marker='o', ms=3, lw=1, label=f"(x={int(x0)%Nx})")
+
+        ax.set_xlabel(r"$r_y$")
+        ax.set_ylabel(r"$C_G(x_0; r_y)$")
+        ax.set_title(f"Squared correlator vs $r_y$ at fixed $x_0$ (N={Nx}, steps={int(max_steps)})")
+        ax.set_yscale('log')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+        # Robust filename encoding for x_positions
+        if filename is None:
+            # encode x positions briefly (support both list of ints and list of (x,label))
+            try:
+                # list of (x,label)
+                xlist = [int(x) for (x, *_) in x_positions]
+            except Exception:
+                # list/array of ints
+                xlist = [int(x) for x in x_positions]
+            xdesc = "-".join(str(int(x) % Nx) for x in xlist)
+            decoh_tag = "_decoh_on" if self.decoh else ""
+            filename = f"corr2_y_profiles_N{Nx}_xs_{xdesc}_steps{int(max_steps)}{decoh_tag}.pdf"
+
+        fullpath = os.path.join(outdir, filename)
+        plt.show()
+        fig.savefig(fullpath)
+        plt.close(fig)
+        return fullpath
 
     def G_CI(self, alpha = 1.0, norm='backward', k_is_centered=False):
         """
@@ -535,6 +809,31 @@ class CI_Lindblad_DW:
 
         outdir = self._ensure_outdir('figs/corr_vs_r')
 
+        # If alphas contains a single value and we already have a cached evolution, reuse it
+        if np.size(alphas) == 1:
+            self._ensure_evolved()
+            G_final = self.G_last
+            a = float(alphas.reshape(-1)[0])
+            C_grid = self.squared_two_point_corr(G_final, rx=rx_arr, ry=ry_arr)
+            if direction == 'diag':
+                L = r_vals.size
+                C_vec = C_grid[np.arange(L), np.arange(L)].astype(float)
+            else:
+                C_vec = C_grid.reshape(-1).astype(float)
+            fig, ax = plt.subplots(figsize=(7, 4.5))
+            ax.plot(r_vals, C_vec, marker='o', ms=3, lw=1, label=f"alpha={a:g}")
+            ax.set_xlabel(r"$r$")
+            ax.set_ylabel(ylabel)
+            ax.set_title(f"Steady-state |G|$^2$ vs r along {title_dir}-path")
+            ax.set_yscale('log'); ax.grid(True, alpha=0.3); ax.legend()
+            plt.tight_layout()
+            outdir = self._ensure_outdir('figs/corr_vs_r')
+            if filename is None:
+                r_desc = f"r0-{r_vals[-1]}"
+                filename = f"corr2_1D_vs_r_dir{title_dir}_N{Nx}_{r_desc}_alpha_{a:g}.pdf"
+            fullpath = os.path.join(outdir, filename)
+            plt.show(); fig.savefig(fullpath, bbox_inches='tight'); plt.close(fig)
+            return fullpath
         fig, ax = plt.subplots(figsize=(7, 4.5))
         for a in alphas:
             solver = CI_Lindblad(Nx=Nx, Ny=Ny, decoh=self.decoh, alpha=a)
@@ -578,72 +877,237 @@ class CI_Lindblad_DW:
         plt.close(fig)
         return fullpath
     
-    def local_chern_marker(self, G):
+    def local_chern_marker(self, G=None, origin=None, mask_outside=False):
         """
-        Local Chern marker C(r) (Bianco–Resta) for a pure Gaussian state G.
-
-        C(r) = 2π i ∑_μ [ G X G Y G − G Y G X G ]_{(r,μ),(r,μ)}
+        Local Chern marker C(r) (Bianco–Resta) for a GS projector, using modular
+        (wrapped) coordinates compatible with periodic boundary conditions to
+        avoid artificial seams.
 
         Parameters
         ----------
-        G : ndarray, shape (Nx, Ny, 2, Nx, Ny, 2)
+        G : ndarray or None
+            Two-point function with shape (Nx, Ny, 2, Nx, Ny, 2). If None, use
+            the cached steady-state `self.G_last`.
+        origin : (int,int) or None
+            Lattice site to place the coordinate origin. The coordinate seam is
+            opposite this point. If None, uses `self.ref` set at init.
+        mask_outside : bool
+            If True, zero out values outside `self.inside_mask` (useful for
+            visualization inside the tri-partition disk).
 
         Returns
         -------
-        tanh(C) : ndarray, shape (Nx, Ny)
-            Tanh ofLocal Chern marker on the torus.
+        C_tanh : ndarray, shape (Nx, Ny)
+            tanh of the local Chern marker on the torus.
         """
-        G = np.asarray(G)
-        Nx, Ny, s1, Nx2, Ny2, s2 = G.shape
+        if G is None:
+            self._ensure_evolved()
+            G = self.G_last
+        P = np.asarray(G.conj())
+        Nx, Ny, s1, Nx2, Ny2, s2 = P.shape
         if (s1, s2) != (2, 2) or (Nx, Ny) != (Nx2, Ny2):
             raise ValueError("G must have shape (Nx, Ny, 2, Nx, Ny, 2).")
 
-        # Coordinate fields (float for safe products)
-        x = np.arange(Nx, dtype=float)
-        y = np.arange(Ny, dtype=float)
-        Xgrid, Ygrid = np.meshgrid(x, y, indexing='ij')   # (Nx, Ny)
+        # --- modular coordinates on the torus ---
+        def modular_coords(N, origin_idx):
+            c = np.arange(N, dtype=float) - float(origin_idx)
+            c = (c + N/2) % N - N/2  # in (-N/2, N/2]
+            return c
 
-        # Helpers: scale by X or Y on the left/right (no full matrix build)
-        def left_X(A):   # (X ∘) : multiply using the left real-space index
-            return Xgrid[:, :, None, None, None] * A
+        if origin is None:
+            x0, y0 = self.ref
+        else:
+            x0, y0 = int(origin[0]) % Nx, int(origin[1]) % Ny
 
-        def right_X(A):  # (∘ X) : multiply using the right real-space index
-            return A * Xgrid[None, None, None, :, :, None]
+        X = modular_coords(Nx, x0)
+        Y = modular_coords(Ny, y0)
+        Xgrid, Ygrid = np.meshgrid(X, Y, indexing='ij')
 
-        def left_Y(A):
-            return Ygrid[:, :, None, None, None] * A
+        # Helpers: multiply by X or Y on left / right real-space indices
+        def left_X(A):   return Xgrid[:, :, None, None, None] * A
+        def right_X(A):  return A * Xgrid[None, None, None, :, :, None]
+        def left_Y(A):   return Ygrid[:, :, None, None, None] * A
+        def right_Y(A):  return A * Ygrid[None, None, None, :, :, None]
 
-        def right_Y(A):
-            return A * Ygrid[None, None, None, :, :, None]
+        def mm(A, B):    return np.einsum('ijslmn,lmnopr->ijsopr', A, B, optimize=True)
 
-        # Generic contraction: (A @ B) over the shared (x',y',s') = (l,m,n)
-        # A: (i,j,s, l,m,n) ; B: (l,m,n, o,p,r)  → (i,j,s, o,p,r)
-        def mm(A, B):
-            return np.einsum('ijslmn,lmnopr->ijsopr', A, B, optimize=True)
+        # Ordered products
+        T = right_X(P); T = mm(T, P); T = right_Y(T); T = mm(T, P)  # G X G Y G
+        U = right_Y(P); U = mm(U, P); U = right_X(U); U = mm(U, P)  # G Y G X G
+        M = (2.0 * np.pi * 1j) * (T - U)
 
-        # --- Build the two ordered products ---
-        # T1 = G X G Y G
-        T = right_X(G)     # G X
-        T = mm(T, G)       # G X G
-        T = right_Y(T)     # (G X G) Y
-        T = mm(T, G)       # G X G Y G
-
-        # T2 = G Y G X G
-        U = right_Y(G)     # G Y
-        U = mm(U, G)       # G Y G
-        U = right_X(U)     # (G Y G) X
-        U = mm(U, G)       # G Y G X G
-
-        # M = 2π i (T1 − T2)
-        M = (2.0 * np.pi * 1j) * (T - U)  # (Nx,Ny,2, Nx,Ny,2)
-
-        # Extract diagonal element at equal position & spin, then sum over spin μ
         ix = np.arange(Nx)[:, None, None]
         iy = np.arange(Ny)[None, :, None]
         ispin = np.arange(2)[None, None, :]
+        diag_vals = M[ix, iy, ispin, ix, iy, ispin]  # (Nx,Ny,2)
+        C = diag_vals.sum(axis=2)                    # (Nx,Ny)
 
-        # Shape (Nx, Ny, 2): element (x,y,μ; x,y,μ)
-        diag_vals = M[ix, iy, ispin, ix, iy, ispin]
-        C = diag_vals.sum(axis=2)  # sum over μ → (Nx, Ny)
+        C = np.tanh(np.real_if_close(C, tol=1e-9))
+        if mask_outside:
+            C = np.where(self.inside_mask, C, 0.0)
+        return C
 
-        return np.tanh(np.real_if_close(C, tol=1e-9))
+
+    def chern_marker_dynamics(self, dt=5e-2, max_steps=250, n_a=0.5,
+                              G_init=None, fps=12, cmap='RdBu_r',
+                              outbasename=None, vmin=-1.0, vmax=1.0):
+        """
+        Animate the local Chern marker C(r) over time using the cached evolution history
+        if available; otherwise, perform a short evolution to generate the frames.
+        Saves a GIF and also saves a static final frame as a PDF image.
+        Returns the paths to both the GIF and the final image, as well as the final arrays.
+
+        Parameters
+        ----------
+        dt : float
+            RK4 time step.
+        max_steps : int
+            Number of RK4 steps.
+        n_a : float
+            Parameter forwarded to Lcycle.
+        G_init : ndarray or None
+            Optional initial state for G; otherwise zeros.
+        fps : int
+            Frames per second of the output GIF.
+        cmap : str
+            Matplotlib colormap for the heatmap.
+        outbasename : str or None
+            Base file name (without extension). If None, a descriptive one is used.
+        vmin, vmax : float
+            Color scale limits for the marker plot.
+
+        Returns
+        -------
+        gif_path : str
+            Full path to the saved GIF.
+        final_path : str
+            Full path to the saved static final frame (PDF).
+        C_last : ndarray, shape (Nx, Ny)
+            Chern marker of the final step.
+        G : ndarray
+            Final G after evolution.
+        """
+        Nx, Ny = int(self.Nx), int(self.Ny)
+
+        # Ensure Lindbladian ingredients exist
+        self._ensure_OW_ready(alpha_hint=1.0)
+
+
+        # Where to save
+        outdir = self._ensure_outdir('figs/chern_marker')
+        if outbasename is None:
+            decoh_tag = 'decoh_on' if self.decoh else 'decoh_off'
+            outbasename = f"chern_marker_dynamics_N{Nx}_steps{int(max_steps)}_{decoh_tag}"
+        gif_path = os.path.join(outdir, outbasename + ".gif")
+
+        # --- Set up compact figure/axes like the reference frame ---
+        # Small square panel with room for a horizontal colorbar above.
+        fig = plt.figure(figsize=(3.2, 3.8))
+        # Main image axes
+        ax = fig.add_axes([0.12, 0.10, 0.78, 0.78])  # [left, bottom, width, height]
+        im = ax.imshow(np.zeros((Nx, Ny)), cmap=cmap, vmin=vmin, vmax=vmax, origin='upper', aspect='equal')
+
+        # Style: thick black border; no axis labels or ticks
+        for spine in ax.spines.values():
+            spine.set_linewidth(1.5)
+            spine.set_color('black')
+        # Show labeled ticks and a light lattice grid
+        ax.set_xlabel("y")
+        ax.set_ylabel("x")
+        # Major ticks every 5 (adjust step if you like)
+        ax.set_xticks(np.arange(0, Ny, max(1, Ny//10)))
+        ax.set_yticks(np.arange(0, Nx, max(1, Nx//10)))
+        ax.tick_params(axis='both', labelsize=8)
+        # Minor ticks at every cell boundary to draw the lattice grid
+        ax.set_xticks(np.arange(-0.5, Ny, 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, Nx, 1), minor=True)
+        ax.grid(which='minor', color='k', linewidth=0.2, alpha=0.25)
+
+        # Horizontal colorbar above the panel with ticks at -1, 0, 1 and text on the left
+        cax = fig.add_axes([0.32, 0.90, 0.36, 0.06])  # a small bar above the image
+        cbar = fig.colorbar(im, cax=cax, orientation='horizontal', ticks=[-1, 0, 1])
+        # Put a LaTeX-like label to the left of the colorbar
+        fig.text(0.70, 0.91, r"$\tanh\mathcal{C}(\mathbf{r})$", fontsize=12)
+
+
+        # Initialize with zeros to guarantee a first frame
+        C = np.zeros((Nx, Ny))
+        im.set_data(C)
+
+        writer = animation.PillowWriter(fps=fps)
+
+        # Timing
+        t_start = time.time()
+        # Use precomputed history if available; otherwise fall back to a quick evolution
+        if hasattr(self, "G_history") and len(self.G_history) > 0:
+            history = self.G_history
+        else:
+            # Fallback: perform a short evolution to get frames
+            G_tmp, G_hist_tmp = self.G_evolution(max_steps=int(max_steps), dt=dt, keep_history=True)
+            history = G_hist_tmp
+
+        with writer.saving(fig, gif_path, dpi=120):
+            writer.grab_frame()
+            for step, G_frame in enumerate(history, start=1):
+                t0 = time.time()
+                C = self.local_chern_marker(G_frame)
+                im.set_data(C)
+                writer.grab_frame()
+
+                iter_time = time.time() - t0
+                clear_output(wait=True)
+                print(f"[chern_marker_dynamics] frame {step}/{len(history)} | "
+                      f"proc={iter_time:.3e}s | total={time.time()-t_start:.3e}s | "
+                      f"N=({Nx},{Ny}) | decoh={self.decoh}")
+
+        plt.close(fig)
+
+        # Final arrays to return
+        C_last = np.round(C, decimals = 2)
+
+        # Save static final frame (same styling as GIF frame)
+        final_path = os.path.join(outdir, outbasename + "_final.pdf")
+        fig2 = plt.figure(figsize=(3.2, 3.8))
+        ax2 = fig2.add_axes([0.12, 0.10, 0.78, 0.78])
+        im2 = ax2.imshow(C_last, cmap=cmap, vmin=vmin, vmax=vmax, origin='upper', aspect='equal')
+        for spine in ax2.spines.values():
+            spine.set_linewidth(1.5)
+            spine.set_color('black')
+        ax2.set_xlabel("y")
+        ax2.set_ylabel("x")
+        ax2.set_xticks(np.arange(0, Ny, max(1, Ny//10)))
+        ax2.set_yticks(np.arange(0, Nx, max(1, Nx//10)))
+        ax2.tick_params(axis='both', labelsize=8)
+        ax2.set_xticks(np.arange(-0.5, Ny, 1), minor=True)
+        ax2.set_yticks(np.arange(-0.5, Nx, 1), minor=True)
+        ax2.grid(which='minor', color='k', linewidth=0.2, alpha=0.25)
+
+        cax2 = fig2.add_axes([0.32, 0.90, 0.36, 0.06])
+        cbar2 = fig2.colorbar(im2, cax=cax2, orientation='horizontal', ticks=[-1, 0, 1])
+        fig2.text(0.70, 0.91, r"$\tanh\mathcal{C}(\mathbf{r})$", fontsize=12)
+
+        fig2.savefig(final_path)
+        plt.show()
+        plt.close(fig2)
+
+        # --- plot and save steady-state line cut: tanh C(x, y=0) vs x ---
+        final_cut_path = os.path.join(outdir, outbasename + "_final_y0_linecut.pdf")
+        fig3 = plt.figure(figsize=(3.2, 3.0))
+        ax3 = fig3.add_axes([0.15, 0.18, 0.80, 0.72])
+
+        x_vals = np.arange(Nx)
+        y0_cut = C_last[:, 0]  # y = 0 column; first index is x (rows), second is y (cols)
+        ax3.plot(x_vals, y0_cut, marker='o', ms=4, lw=1)
+
+        ax3.set_xlabel("x")
+        ax3.set_ylabel(r"$\tanh\,\mathcal{C}(x,y\!=\!0)$")
+        ax3.grid(True, alpha=0.3)
+
+        fig3.savefig(final_cut_path)
+        plt.show()
+        plt.close(fig3)
+
+        return gif_path, final_path, C_last, G
+
+
+       
