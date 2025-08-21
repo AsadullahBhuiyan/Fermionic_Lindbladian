@@ -1,42 +1,25 @@
 import numpy as np
 import math
 import time
+import os
+import matplotlib.animation as animation
 from IPython.display import clear_output
 from matplotlib import pyplot as plt
-import os
 
 class CI_Lindblad:
-    def __init__(self, Nx, Ny, decoh = True, alpha = 1.0, nshell = None):
+    def __init__(self, Nx, Ny, decoh=True, alpha_init=1.0, nshell=None, dt_init=5e-2, max_steps_init=250, n_a_init=0.5, keep_history_init=True, G_init=None):
         """
         1) Build overcomplete Wannier spinors for a Chern insulator model.
 
         2) Generate masks for each partition A,B,C for computation of real space chern number
         """
         self.Nx, self.Ny = Nx, Ny
-        self.alpha = alpha
         self.decoh = decoh
-        self.construct_OW_functions(self.alpha, nshell = nshell) # construct Wannier functions
-
-        # lazy-evolution cache (filled on demand)
-        self.G_last   = None
-        self.G_history = []
-        self.evo_dt    = 5e-2
-        self.evo_steps = 500
-        # evolve once so the instance is immediately usable
-        self._ensure_evolved(dt=self.evo_dt, max_steps=self.evo_steps, keep_history=True)
-    def _ensure_evolved(self, dt=5e-2, max_steps=500, keep_history=True, G_init=None):
-        """Make sure self.G_last/self.G_history exist for the requested (dt,max_steps).
-        Re-runs evolution only when necessary."""
-        need = (self.G_last is None or
-                getattr(self, 'evo_dt', None) != dt or
-                getattr(self, 'evo_steps', None) != int(max_steps) or
-                (keep_history and (self.G_history is None or len(self.G_history) < int(max_steps))))
-        if need:
-            G, hist = self.G_evolution(max_steps=int(max_steps), dt=dt,
-                                       G_init=G_init, keep_history=keep_history)
-            # G_evolution updates cache already; nothing else to do
-            return G, hist
-        return self.G_last, self.G_history
+        self.alpha = None
+        self.dt_default = float(dt_init)
+        self.max_steps_default = int(max_steps_init)
+        self.n_a_default = float(n_a_init)
+        self.keep_history_default = bool(keep_history_init)
 
         # --- Build tri-partition masks A, B, C inside a circle of radius R ---
         R = 0.4 * min(Nx, Ny)
@@ -76,132 +59,157 @@ class CI_Lindblad:
         self.inside_mask = inside
         self.R = R
         self.ref = (xref, yref)
-    
+
         print('Class CI_Lindblad has been Initialized')
+
+        # --- Build overcomplete Wannier data; evolve only if not already cached ---
+        # Construct OW (may set a spatially varying alpha if DW=True)
+        self.construct_OW_functions(alpha_init, nshell=nshell)
+        # Only perform the initial evolution if we don't already have cached results
+        if not hasattr(self, "G_last") or self.G_last is None:
+            G_last, G_hist = self.G_evolution(max_steps=self.max_steps_default,
+                                              dt=self.dt_default,
+                                              G_init=G_init,
+                                              keep_history=self.keep_history_default)
+            self.G_last = G_last
+            self.G_history = G_hist
+
+    def _ensure_outdir(self, path):
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _ensure_OW_ready(self, alpha_hint=1.0):
+        """Ensure overcomplete Wannier (OW) structures exist before evolution.
+        If they are missing, build them with the provided alpha hint (default 1.0).
+        """
+        need = False
+        for attr in ("Pminus_k", "Pplus_k",
+                     "W_A_plus","W_B_plus","W_A_minus","W_B_minus",
+                     "V_A_plus","V_B_plus","V_A_minus","V_B_minus",
+                     "V_plus","V_minus"):
+            if not hasattr(self, attr):
+                need = True
+                break
+        if need:
+            ah = float(alpha_hint if self.alpha is None else self.alpha)
+            self.construct_OW_functions(ah)
+
+    def _ensure_evolved(self):
+        """Ensure self.G_last / self.G_history exist (run one short evolution if missing)."""
+        if not hasattr(self, "G_last") or self.G_last is None:
+            G_last, G_hist = self.G_evolution(max_steps=self.max_steps_default,
+                                              dt=self.dt_default,
+                                              G_init=None,
+                                              keep_history=self.keep_history_default)
+            self.G_last = G_last
+            self.G_history = G_hist
 
     def construct_OW_functions(self, alpha, nshell=None):
         '''
-        Build overcomplete Wannier spinors for a *uniform* Chern-insulator
-        with scalar alpha (no domain wall).
+        Build overcomplete Wannier data for a **uniform** Chern insulator
+        with scalar mass parameter alpha (float).
 
-        Produces four fields on the instance:
-          self.W_A_plus, self.W_B_plus, self.W_A_minus, self.W_B_minus
-        each of shape (Nx, Ny, 2, Nx, Ny) with axes:
+        Produces four fields:
+          self.W_A_plus, self.W_B_plus, self.W_A_minus, self.W_B_minus,
+        each of shape (Nx, Ny, 2, Rx, Ry) with axes:
           (x, y, mu, R_x, R_y)
-        and normalized per (R_x, R_y): sum_{x,y,mu} |W|^2 = 1.
+
+        Also stores k-space band projectors **without** center axes:
+          self.Pminus_k, self.Pplus_k  (Nx, Ny, 2, 2)
 
         If nshell is provided (integer), the real-space Wannier functions W are truncated
         to a square window of size (2*nshell+1)×(2*nshell+1) centered at each (R_x, R_y)
-        using minimal-image (periodic) distances on the torus, and then renormalized
-        per center.
+        using minimal-image (periodic) distances on the torus, then re-normalized per center.
         '''
-        # store scalar alpha
-        self.alpha = float(alpha)
-        self.nshell = nshell
-
         Nx, Ny = int(self.Nx), int(self.Ny)
+        self.alpha = float(alpha)
 
-        # --- k-grids (FFT ordering) ---
-        kx = 2*np.pi * np.fft.fftfreq(Nx, d=1.0)   # (Nx,)
-        ky = 2*np.pi * np.fft.fftfreq(Ny, d=1.0)   # (Ny,)
+        # k-grid
+        kx = 2*np.pi * np.fft.fftfreq(Nx, d=1.0)
+        ky = 2*np.pi * np.fft.fftfreq(Ny, d=1.0)
         KX, KY = np.meshgrid(kx, ky, indexing='ij')  # (Nx,Ny)
 
-        # --- model vector n(k) ---
-        nx = np.sin(KX)          # (Nx,Ny)
-        ny = np.sin(KY)          # (Nx,Ny)
-        nz = self.alpha - np.cos(KX) - np.cos(KY)
-        nmag = np.sqrt(nx**2 + ny**2 + nz**2)
+        # Model vector n(k) for uniform alpha (all 2D, no center axes)
+        nx = np.sin(KX)                 # (Nx,Ny)
+        ny = np.sin(KY)                 # (Nx,Ny)
+        nz = (self.alpha - np.cos(KX) - np.cos(KY))  # (Nx,Ny)
+        nmag = np.sqrt(nx*nx + ny*ny + nz*nz)
         nmag = np.where(nmag == 0, 1e-15, nmag)
 
-        # (optional) keep handy for debugging/inspection
-        self.nx, self.ny, self.nz, self.nmag = nx, ny, nz, nmag
+        # Pauli matrices
+        sx = np.array([[0,1],[1,0]], dtype=complex)
+        sy = np.array([[0,-1j],[1j,0]], dtype=complex)
+        sz = np.array([[1,0],[0,-1]], dtype=complex)
+        I2 = np.eye(2, dtype=complex)
 
-        # --- Pauli matrices and identity ---
-        pauli_x = np.array([[0, 1], [1, 0]], dtype=complex)
-        pauli_y = np.array([[0, -1j], [1j, 0]], dtype=complex)
-        pauli_z = np.array([[1, 0], [0, -1]], dtype=complex)
-        Id2 = np.eye(2, dtype=complex)
+        # hk(k) and band projectors in k-space (NO center axes)
+        hk_k = (nx[...,None,None]*sx + ny[...,None,None]*sy + nz[...,None,None]*sz) / nmag[...,None,None]  # (Nx,Ny,2,2)
+        self.Pminus_k = 0.5*(I2 - hk_k)   # (Nx,Ny,2,2)
+        self.Pplus_k  = 0.5*(I2 + hk_k)   # (Nx,Ny,2,2)
 
-        # --- k-space single-particle h(k) = n̂ · σ, projectors P±(k) ---
-        hk = (nx[..., None, None] * pauli_x +
-              ny[..., None, None] * pauli_y +
-              nz[..., None, None] * pauli_z) / nmag[..., None, None]   # (Nx,Ny,2,2)
+        # Center phases for *all* centers (Rx,Ry)
+        Rx_grid = np.arange(Nx)  # (Rx,)
+        Ry_grid = np.arange(Ny)  # (Ry,)
+        phase_x = np.exp(1j * KX[..., None, None] * Rx_grid[None, None, :, None])  # (Nx,Ny,Rx,1)
+        phase_y = np.exp(1j * KY[..., None, None] * Ry_grid[None, None, None, :])  # (Nx,Ny,1,Ry)
+        phase   = phase_x * phase_y                                                # (Nx,Ny,Rx,Ry)
 
-        self.Pminus = 0.5 * (Id2 - hk)   # (Nx,Ny,2,2)
-        self.Pplus  = 0.5 * (Id2 + hk)   # (Nx,Ny,2,2)
+        # Helper: FFT over k-axes only
+        def k2_to_r2(Ak):    # Ak: (Nx,Ny,Rx,Ry)
+            return np.fft.fft2(Ak, axes=(0,1))
 
-        # --- local orbital choices (columns) ---
-        tauA = (1/np.sqrt(2)) * np.array([[1], [1]], dtype=complex)    # (2,1)
-        tauB = (1/np.sqrt(2)) * np.array([[1], [-1]], dtype=complex)   # (2,1)
+        # local orbital spinors
+        tauA = (1/np.sqrt(2))*np.array([[1],[1]],  dtype=complex)  # (2,1)
+        tauB = (1/np.sqrt(2))*np.array([[1],[-1]], dtype=complex)  # (2,1)
 
-        # --- phases for all centers (R_x, R_y) ---
-        Rx_grid = np.arange(Nx)  # (Nx,)
-        Ry_grid = np.arange(Ny)  # (Ny,)
-        phase_x = np.exp(1j * KX[..., None, None] * Rx_grid[None, None, :, None])  # (Nx,Ny,Nx,1)
-        phase_y = np.exp(1j * KY[..., None, None] * Ry_grid[None, None, None, :])  # (Nx,Ny,1,Ny)
-        phase   = phase_x * phase_y  # (Nx,Ny,Nx,Ny)
+        # Build normalized W for all centers from **4D** projectors (broadcast through phase)
+        def make_W(Pband_k, tau, phase):
+            # tau^† P(k): (Nx,Ny,2)
+            tau_dag = tau[:,0].conj()                          # (2,)
+            psi_k   = np.einsum('m,ijmn->ijn', tau_dag, Pband_k)  # (Nx,Ny,2)
 
-        # --- FFT over k-axes only ---
-        def k2_to_r2(Ak):  # Ak shape (Nx,Ny,*,*)  (the trailing axes are broadcast centers)
-            return np.fft.fft2(Ak, axes=(0, 1))
+            # Apply center phases; add center axes via broadcasting
+            F0 = phase * psi_k[:,:,0][..., None, None]         # (Nx,Ny,Rx,Ry)
+            F1 = phase * psi_k[:,:,1][..., None, None]         # (Nx,Ny,Rx,Ry)
 
-        # --- optional square window mask for truncation (Nx,Ny,Rx,Ry) ---
-        def _square_window_mask(nshell_val):
-            if nshell_val is None:
-                return None
-            x = np.arange(Nx)[:, None, None, None]   # (Nx,1,1,1)
-            y = np.arange(Ny)[None, :, None, None]   # (1,Ny,1,1)
-            Rx = np.arange(Nx)[None, None, :, None]  # (1,1,Nx,1)
-            Ry = np.arange(Ny)[None, None, None, :]  # (1,1,1,Ny)
-            dx = ((x - Rx + Nx//2) % Nx) - Nx//2     # minimal-image separation
-            dy = ((y - Ry + Ny//2) % Ny) - Ny//2
-            return (np.abs(dx) <= nshell_val) & (np.abs(dy) <= nshell_val)  # (Nx,Ny,Nx,Ny)
+            # FFT k→r *per center* for each spinor component
+            W0 = k2_to_r2(F0)                                  # (Nx,Ny,Rx,Ry)
+            W1 = k2_to_r2(F1)                                  # (Nx,Ny,Rx,Ry)
 
-        shell_mask = _square_window_mask(nshell)
+            # Stack spinor components → (Nx,Ny,2,Rx,Ry)
+            W  = np.moveaxis(np.stack([W0, W1], axis=-1), -1, 2)
 
-        # ------------------------------
-        # helper to build a normalized W for ALL centers (uniform alpha)
-        # psi_k(k) = tau^† P_band(k) → (Nx,Ny,2)
-        # ------------------------------
-        def make_W(Pband, tau):
-            tau_dag = tau[:, 0].conj()                                   # (2,)
-            psi_k   = np.einsum('m,ijmn->ijn', tau_dag, Pband)           # (Nx,Ny,2)
+            # Optional truncation and per-center normalization
+            if nshell is not None:
+                x = np.arange(Nx)[:,None,None,None]  # (Nx,1,1,1)
+                y = np.arange(Ny)[None,:,None,None]  # (1,Ny,1,1)
+                Rx = np.arange(Nx)[None,None,:,None] # (1,1,Rx,1)
+                Ry = np.arange(Ny)[None,None,None,:] # (1,1,1,Ry)
+                dx = ((x - Rx + Nx//2) % Nx) - Nx//2
+                dy = ((y - Ry + Ny//2) % Ny) - Ny//2
+                mask = (np.abs(dx) <= nshell) & (np.abs(dy) <= nshell)   # (Nx,Ny,Rx,Ry)
+                W *= mask[:, :, None, :, :]  # expand to (Nx,Ny,2,Rx,Ry)
 
-            F0 = phase * psi_k[:, :, 0][..., None, None]                 # (Nx,Ny,Nx,Ny)
-            F1 = phase * psi_k[:, :, 1][..., None, None]                 # (Nx,Ny,Nx,Ny)
-            W0 = k2_to_r2(F0)                                            # (Nx,Ny,Nx,Ny)
-            W1 = k2_to_r2(F1)                                            # (Nx,Ny,Nx,Ny)
+            denom = np.sqrt(np.sum(np.abs(W)**2, axis=(0,1,2), keepdims=True)) + 1e-15  # (1,1,1,Rx,Ry)
+            return W / denom
 
-            # Stack μ=0,1 as axis 2 → (Nx,Ny,2,Nx,Ny)
-            W = np.moveaxis(np.stack([W0, W1], axis=-1), -1, 2)
+        # Overcomplete Wannier spinors for all centers
+        self.W_A_plus  = make_W(self.Pplus_k,  tauA, phase)
+        self.W_B_plus  = make_W(self.Pplus_k,  tauB, phase)
+        self.W_A_minus = make_W(self.Pminus_k, tauA, phase)
+        self.W_B_minus = make_W(self.Pminus_k, tauB, phase)
 
-            # Truncation (if requested), then per-center normalization
-            if shell_mask is not None:
-                W = W * shell_mask[:, :, None, :, :]                     # (Nx,Ny,2,Nx,Ny)
-
-            denom2 = np.sum(np.abs(W)**2, axis=(0, 1, 2), keepdims=True) # (1,1,1,Nx,Ny)
-            W = np.where(denom2 > 1e-15, W / (np.sqrt(denom2) + 1e-15), 0.0)
-            return W
-
-        # Build four overcomplete Wannier spinors for ALL centers: (Nx,Ny,2,Nx,Ny)
-        self.W_A_plus  = make_W(self.Pplus,  tauA)
-        self.W_B_plus  = make_W(self.Pplus,  tauB)
-        self.W_A_minus = make_W(self.Pminus, tauA)
-        self.W_B_minus = make_W(self.Pminus, tauB)
-
-        # Build V = Σ_R |W_R⟩⟨W_R| (sum over centers), for each family
+        # V = sum_R |W_R⟩⟨W_R|
         def make_V(W):
-            # W: (i,j,k,l,m) = (x,y,μ,Rx,Ry)
-            # V: (i,j,k,p,q,r) by contracting over centers l,m:
-            return np.einsum('ijklm,pqrlm->ijkpqr', W, W.conj(), optimize=True)
+            return np.einsum('ijklm, pqrlm -> ijkpqr', W, W.conj(), optimize=True)
 
         self.V_A_minus = make_V(self.W_A_minus)
         self.V_B_minus = make_V(self.W_B_minus)
-        self.V_minus   = self.V_A_minus + self.V_B_minus  # sum over ν
+        self.V_minus   = self.V_A_minus + self.V_B_minus
 
         self.V_A_plus  = make_V(self.W_A_plus)
         self.V_B_plus  = make_V(self.W_B_plus)
-        self.V_plus    = self.V_A_plus + self.V_B_plus    # sum over ν
+        self.V_plus    = self.V_A_plus + self.V_B_plus     
     
     def Lgain(self, G, n_a):
         '''
@@ -321,6 +329,9 @@ class CI_Lindblad:
         """
         Nx, Ny = int(self.Nx), int(self.Ny)
 
+        # Make sure OW data (V_± etc.) are available before calling Lcycle
+        self._ensure_OW_ready(alpha_hint=1.0)
+
         # Initialize G
         if G_init is None:
             G = np.zeros((Nx, Ny, 2, Nx, Ny, 2), dtype=dtype)
@@ -343,13 +354,11 @@ class CI_Lindblad:
                 G_history.append(G.copy())
             # live status line
             clear_output(wait=True)
-            print(f"[G_evolution] iter {step}/{int(max_steps)} | dt={dt:.3e} | itertime={iter_time:.3e}s | total={time.time()-t_start:.3e}s | alpha={self.alpha:g} | N=({self.Nx},{self.Ny})")
+            print(f"[G_evolution] iter {step}/{int(max_steps)} | dt={dt:.3e} | itertime={iter_time:.3e}s | total={time.time()-t_start:.3e}s | N=({self.Nx},{self.Ny})")
 
-        # Update cache attributes
+        # Cache last and history for reuse
         self.G_last = G
-        self.G_history = G_history if keep_history else []
-        self.evo_dt = dt
-        self.evo_steps = int(max_steps)
+        self.G_history = list(G_history) if keep_history else []
         return G, G_history
 
     # -----------------------------
@@ -451,21 +460,6 @@ class CI_Lindblad:
         if (s1, s2) != (2, 2) or (Nx, Ny) != (Nx2, Ny2):
             raise ValueError("G must have shape (Nx, Ny, 2, Nx, Ny, 2).")
 
-    def squared_two_point_corr_xslice(self, G=None, x0=0, ry=0):
-        if G is None:
-            self._ensure_evolved()
-            G = self.G_last
-        G = np.asarray(G)
-        Nx, Ny, s1, Nx2, Ny2, s2 = G.shape
-        x0 = int(x0) % Nx
-        Y  = np.arange(Ny)[:, None]
-        ry_arr = np.atleast_1d(ry).astype(int)
-        Yp = (Y + ry_arr[None, :]) % Ny
-        Yb = np.broadcast_to(Y, Yp.shape)
-        blocks = G[x0, Yb, :, x0, Yp, :]
-        C = np.sum(np.abs(blocks)**2, axis=(0, 2, 3)) / (2.0 * Ny)
-        return C
-
         # Prepare base grids of starting sites r' = (x,y)
         X, Y = np.meshgrid(np.arange(Nx), np.arange(Ny), indexing='ij')
 
@@ -488,270 +482,78 @@ class CI_Lindblad:
         C = np.sum(np.abs(blocks)**2, axis=(0, 1, 4, 5)) / (2.0 * Nx * Ny)
         return C
 
-    def G_CI(self, alpha = 1.0, norm='backward', k_is_centered=False):
+
+    def squared_two_point_corr_xslice(self, G=None, x0=0, ry=0):
         """
-        Construct and return the real-space two-point function G = P_minuns.conj()
-        for the Chern-insulator Hamiltonian defined by (Nx, Ny, alpha)
-        at half-filling.
+        Squared two-point correlator along y for a fixed x = x0:
+
+            C_x0(ry) = (1 / (2 Ny)) * sum_{mu,mu', y'}
+                        | G[(x0,y',mu), (x0,y'+ry, mu')] |^2
 
         Parameters
         ----------
-        alpha : float or None
-            If None, uses self.alpha. Otherwise overrides.
-        norm : {'backward','ortho','forward'}
-            FFT normalization passed to np.fft.ifft2.
-        k_is_centered : bool
-            If True, assumes nk is fftshifted (k=0 at center) before IFFT.
+        G  : ndarray, shape (Nx, Ny, 2, Nx, Ny, 2)
+        x0 : int
+            Fixed x-column at which to compute the correlator (mod Nx).
+        ry : int or array-like of int
+            y-separations. Scalars or 1D array.
 
         Returns
         -------
-        Pminus_realspace : ndarray, shape (Nx, Ny, 2, Nx, Ny, 2)
-            Real-space projector onto the occupied band.
+        C : ndarray, shape (len(ry),)
+            Squared correlator vs ry at fixed x0.
         """
+        if G is None:
+            self._ensure_evolved()
+            G = self.G_last
+        G = np.asarray(G)
+        Nx, Ny, s1, Nx2, Ny2, s2 = G.shape
+        if (s1, s2) != (2, 2) or (Nx, Ny) != (Nx2, Ny2):
+            raise ValueError("G must have shape (Nx, Ny, 2, Nx, Ny, 2).")
+        x0 = int(x0) % Nx
 
-        Nx, Ny = int(self.Nx), int(self.Ny)
+        # y' grid and separations
+        Y = np.arange(Ny, dtype=np.intp)[:, None]        # (Ny, 1)
+        ry_arr = np.atleast_1d(ry).astype(np.intp)       # (R,)
+        R = ry_arr.size
+        Yp = (Y + ry_arr[None, :]) % Ny                  # (Ny, R)
 
-        if alpha != self.alpha:
-            self.construct_OW_functions(alpha)
+        # Extract the x0-column-to-x0-column block once: shape (Ny, 2, Ny, 2)
+        Gx = G[x0, :, :, x0, :, :]                       # (Ny, 2, Ny, 2)
 
-        # --- vectorized: k → relative real-space for full (Nx,Ny,2,2) tensor ---
-        def _k_to_r_rel_full(Pk): # Pk shape (Nx,Ny,2,2)
-            # Optional un-centering in k
-            if k_is_centered:
-                Pk = np.fft.ifftshift(Pk, axes=(0, 1))
-            # IFFT over k-axes only
-            PR = np.fft.ifft2(Pk, axes=(0, 1), norm=norm) # (Nx,Ny,2,2)
-            PR = np.real_if_close(PR, tol=1e3)
-            # Build relative-coordinate indexers once (broadcasted)
-            x = np.arange(Nx); y = np.arange(Ny)
-            X  = x[:, None, None, None]
-            Xp = x[None, None, :, None]
-            Y  = y[None, :, None, None]
-            Yp = y[None, None, None, :]
-            dX = (X - Xp) % Nx # (Nx,1,Nx,1)
-            dY = (Y - Yp) % Ny # (1,Ny,1,Ny)
-            
-            # Advanced indexing lifts (Nx,Ny,2,2) → (Nx,Ny,Nx,Ny,2,2)
-            return PR[dX, dY, :, :]
+        # Reorder so the two y-axes are adjacent, then flatten (y, y') → flat index
+        # Gx_re has shape (Ny*Ny, 2, 2) where flat = y * Ny + y'
+        Gx_re = np.transpose(Gx, (0, 2, 1, 3)).reshape(Ny*Ny, 2, 2)
 
-        # Transform entire Pminus at once
-        Pminus_rel = _k_to_r_rel_full(self.Pminus) # (Nx,Ny,Nx,Ny,2,2)
-       
-        # Reorder to (Nx,Ny,2,Nx,Ny,2) and use G = P.conj()
-        G = np.moveaxis(Pminus_rel.conj(), 4, 2)
+        # Build flat indices for all (y, y+ry) pairs, then gather and reshape to (Ny, R, 2, 2)
+        flat_idx = (Y * Ny + Yp).reshape(-1)             # (Ny*R,)
+        blocks = Gx_re[flat_idx].reshape(Ny, R, 2, 2)    # (Ny, R, 2, 2)
 
-        return G
+        # Average over y' and spins → (R,)
+        C = np.sum(np.abs(blocks)**2, axis=(0, 2, 3)) / (2.0 * Ny)
+        return C
 
-    def chern_dynamics_vs_time(self, alpha = 1.0, max_steps=500, G_init=None, keep_history=False, dtype=complex):
+
+    def plot_corr_y_profiles(self, dt=5e-2, max_steps=500, n_a=0.5,
+                             x_positions=None, ry_max=None, filename=None):
         """
-        Evolve G with RK4 and compute the Chern number at each time step (fixed alpha).
-        Uses cached evolution if available.
-        """
-        # If alpha is changed, reconstruct and invalidate cache.
-        if alpha != self.alpha:
-            self.construct_OW_functions(alpha)
-            self.G_last = None
-            self.G_history = []
-        # Ensure evolution (always keep history for dynamics)
-        self._ensure_evolved(dt=5e-2, max_steps=int(max_steps), keep_history=True, G_init=G_init)
-        # Use cached history
-        chern_vals = [self.real_space_chern_number(Gi) for Gi in self.G_history]
-        ts = np.arange(1, len(chern_vals)+1, dtype=float)  # time steps (1-based)
-        return ts, np.asarray(chern_vals), self.G_last, self.G_history
+        Plot squared two-point correlation vs y-separation at several fixed x columns
+        chosen to probe the domain-wall geometry:
+          - deep in the topological bulk (alpha=1 slab center),
+          - deep in each trivial bulk (alpha=3) on left and right,
+          - at the left and right domain walls (interfaces).
 
-    def chern_steady_vs_alpha(self, alpha_list):
-        """
-        For each alpha in `alpha_list`, build a fresh CI_Lindblad at that alpha,
-        evolve to `max_steps`, and return the (real-space) Chern number of the
-        final state G.
+        If x_positions is provided, it should be a list of (x0, label) pairs to plot.
 
         Parameters
         ----------
-        alphas : array-like
-            Sequence of alpha values to scan.
-        dt : float
-            Time step for evolution.
-        max_steps : int
-            Number of RK4 steps for the steady-state approximation.
-        n_a : float, optional
-            Parameter forwarded to Lcycle.
-        dtype : dtype, optional
-            Dtype for zero initial state.
-
-        Returns
-        -------
-        alpha_list : ndarray
-            Array of alpha values.
-        chern_list : ndarray
-            Chern number (complex) for the final G at each alpha.
-        """
-        alpha_list = np.asarray(alpha_list, dtype=float)
-        chern_list = np.empty_like(alpha_list, dtype=complex)
-
-        for i, a in enumerate(alpha_list):
-            solver = CI_Lindblad(Nx=self.Nx, Ny=self.Ny, decoh=self.decoh, alpha=a)
-            solver._ensure_evolved(dt=5e-2, max_steps=500, keep_history=False)
-            chern_list[i] = solver.real_space_chern_number(solver.G_last)
-
-        return chern_list
-    
-    def find_saturation_timestep(self, dt=5e-2, tol=1e-3, max_steps=100000, G_init=None, dtype=complex):
-        """
-        Find the earliest RK4 step at which the real-space Chern number saturates to 1
-        within a specified tolerance, using alpha fixed to 1.
-
-        This method time-evolves G starting from a zero-charge state (or provided G_init)
-        with the RK4 integrator and checks after each step whether
-            abs(Re(Chern(G)) - 1) <= tol.
-        It stops at the first step that satisfies the criterion and returns that step index
-        (1-based) and the corresponding physical time (step*dt).
-
-        Parameters
-        ----------
-        dt : float
-            Time step for RK4.
-        tol : float, optional
-            Convergence tolerance on |Re(Chern) - 1|. Default 1e-4.
-        max_steps : int, optional
-            Maximum number of steps to attempt before giving up (default 100000).
-        n_a : float, optional
-            Parameter forwarded to Lcycle.
-        G_init : ndarray or None, optional
-            If provided, must have shape (Nx, Ny, 2, Nx, Ny, 2). If None, uses zeros.
-        dtype : dtype, optional
-            Dtype for zero initial state if G_init is None.
-
-        Returns
-        -------
-        step_idx : int
-            The first step index (1-based) at which the tolerance is met. If not met,
-            returns max_steps.
-        t_final : float
-            The physical time corresponding to that step (step_idx * dt).
-        Chern_val : complex
-            The Chern number at the returned step.
-        G : ndarray
-            The state G at the returned step.
-        """
-        Nx, Ny = int(self.Nx), int(self.Ny)
-
-        # Initialize G
-        if G_init is None:
-            G = np.zeros((Nx, Ny, 2, Nx, Ny, 2), dtype=dtype)
-        else:
-            expected = (Nx, Ny, 2, Nx, Ny, 2)
-            if G_init.shape != expected:
-                raise ValueError(f"G_init must have shape {expected}, got {G_init.shape}")
-            G = np.array(G_init, copy=True)
-
-        step_idx = int(max_steps)
-        ch_val = None
-
-        # Insert timer start
-        t_start = time.time()
-        for step in range(1, int(max_steps) + 1):
-            t0 = time.time()
-            G, _ = self.rk4_Lindblad_evolver(G, dt)
-            ch = self.real_space_chern_number(G)
-            err = abs(ch.real - 1.0)
-            iter_time = time.time() - t0
-            print(f"[iter {step:6d}/{int(max_steps)}] t={step*dt:.6f} | itertime={iter_time:.3e}s | total={time.time()-t_start:.3e}s | |Re(Chern)-1|={err:.6e} | trG/(2NxNy)={(np.reshape(G,(2*Nx*Ny, 2*Nx*Ny)).trace().real)/(2*Nx*Ny):.3f}")
-            clear_output(wait = True)
-            # Check saturation against target Chern = 1 using real part
-            if err <= tol:
-                step_idx = step
-                ch_val = ch
-                break
-        else:
-            # If never broke out, record the last values
-            ch_val = ch  # from the final iteration
-
-        t_final = step_idx * dt
-        return step_idx, t_final, ch_val, G
-
-
-    # -----------------------------
-    # Plotting helpers
-    # -----------------------------
-    
-    def _ensure_outdir(self, subpath):
-        """Create (if needed) and return an output directory path under CWD.
-        subpath can include nested folders like 'figs/chern_dynamics'."""
-        outdir = os.path.join(os.getcwd(), subpath)
-        os.makedirs(outdir, exist_ok=True)
-        return outdir
-    
-    def plot_chern_dynamics_vs_time(self, N_list=(11, 21, 31), alpha=None,
-                                    dt=5e-2, max_steps=500, filename=None):
-        """
-        Plot real-space Chern number vs time for fixed alpha and varying system size.
-
-        Parameters
-        ----------
-        N_list : iterable of int
-            System sizes (square lattices N×N) to plot.
-        alpha : float or None
-            Chern-insulator mass parameter. If None, uses self.alpha.
-        dt : float
-            RK4 time step.
-        max_steps : int
-            Number of steps.
+        dt, max_steps, n_a : evolution parameters passed to RK4 (if we evolve here).
+        x_positions : list[(int,str)] or None
+            Custom columns and labels. If None, choose sensible positions from DW geometry.
+        ry_max : int or None
+            Max y-separation r_y to plot; default Ny//2.
         filename : str or None
-            PDF filename to save. If None, a descriptive one is generated.
-        """
-        alpha_val = float(self.alpha if alpha is None else alpha)
-        outdir = self._ensure_outdir('figs/chern_dynamics')
-
-        fig, ax = plt.subplots(figsize=(7, 4.5))
-        marker_list = ['o', 'x', '*']
-        for idx, N in enumerate(N_list):
-            solver = CI_Lindblad(Nx=N, Ny=N, decoh=self.decoh, alpha=alpha_val)
-            solver._ensure_evolved(dt=dt, max_steps=int(max_steps), keep_history=True)
-            ch = np.array([solver.real_space_chern_number(Gi).real for Gi in solver.G_history])
-            ts = np.arange(1, len(ch)+1) * dt
-            ax.plot(ts, ch, label=f"N={N}", marker=marker_list[idx], markevery=int(1/dt))
-
-        ax.set_xlabel("t")
-        ax.set_ylabel("real-space Chern number")
-        ax.set_title(f"Chern dynamics vs t (alpha={alpha_val:g})")
-        ax.grid(True, alpha=0.3)
-        ax.legend()
-        plt.tight_layout()
-
-        if filename is None:
-            Ns = "-".join(str(n) for n in N_list)
-            if self.decoh:
-                filename = f"chern_dynamics_vs_time_alpha{alpha_val:g}_Ns{Ns}_decoh_on.pdf"
-            else:
-                filename = f"chern_dynamics_vs_time_alpha{alpha_val:g}_Ns{Ns}_decoh_off.pdf"
-        # Save to outdir (filename is just the basename, not a path)
-        fullpath = os.path.join(outdir, filename)
-        plt.tight_layout()
-        plt.show()
-        fig.savefig(fullpath, bbox_inches='tight')
-        plt.close(fig)
-        return fullpath
-
-    def plot_chern_dynamics_vs_time_nshell(self, nshell_list=(None, 1, 2, 3), alpha=None,
-                                           dt=5e-2, max_steps=500, filename=None):
-        """
-        Plot real-space Chern number vs time for a *fixed* system size (self.Nx,self.Ny),
-        fixed alpha, and varying truncation window `nshell` used to build the overcomplete
-        Wannier functions.
-
-        Parameters
-        ----------
-        nshell_list : iterable of int or None
-            Sequence of truncation radii to compare. Use None to denote "no truncation".
-        alpha : float or None
-            Chern-insulator mass parameter to use for all curves. If None, uses self.alpha.
-        dt : float
-            RK4 time step.
-        max_steps : int
-            Number of RK4 steps.
-        filename : str or None
-            PDF filename to save. If None, a descriptive one is generated and saved under
-            figs/chern_dynamics_nshell/ .
+            PDF basename to save. If None, a descriptive name is generated.
 
         Returns
         -------
@@ -759,124 +561,159 @@ class CI_Lindblad:
             Full path to the saved PDF.
         """
         Nx, Ny = int(self.Nx), int(self.Ny)
-        alpha_val = float(self.alpha if alpha is None else alpha)
 
-        outdir = self._ensure_outdir('figs/chern_dynamics_nshell')
+        # Ensure Lindbladian ingredients exist
+        self._ensure_OW_ready(alpha_hint=1.0)
 
+        # Use cached steady-state
+        self._ensure_evolved()
+        G = self.G_last
+
+        # Default y-range
+        if ry_max is None:
+            ry_max = Ny // 2
+        ry_vals = np.arange(0, int(ry_max) + 1, dtype=int)
+
+        # Default x-positions from the domain-wall construction used in construct_OW_functions:
+        # central slab: x in [x0, x1) has alpha=1; outside is alpha=3
+        if x_positions is None:
+            #half = Nx // 2
+            #w = int(np.floor(0.2 * Nx))
+            #x0 = max(0, half - w)
+            #x1 = min(Nx, half + w + 1)  # end-exclusive
+
+            ## Representative columns
+            #x_topo   = (x0 + x1) // 2                        # deep inside topo slab
+            #x_triv_L = x0 // 2                               # middle of left trivial bulk
+            #x_triv_R = (x1 + Nx) // 2                        # middle of right trivial bulk
+            #x_wall_L = (x0 - 1) % Nx                         # just left of slab (interface)
+            #x_wall_R = x1 % Nx                               # just right of slab (interface)
+
+            #x_positions = [
+            #    (x_topo,   "topo bulk"),
+            #    (x_triv_L, "trivial (L)"),
+            #    (x_triv_R, "trivial (R)"),
+            #    (x_wall_L, "wall (L)"),
+            #    (x_wall_R, "wall (R)"),
+            #]
+            x_positions = np.arange(4, 27)
+
+        # Plot
+        outdir = self._ensure_outdir('figs/corr_y_profiles')
         fig, ax = plt.subplots(figsize=(7, 4.5))
-        # a few distinct markers to rotate through
-        marker_cycle = ['o', 's', 'x', '^', 'D', '*', 'P']
-        mevery = max(1, int(round(1.0/dt)))  # show a marker about once per unit time
 
-        for i, ns in enumerate(nshell_list):
-            # Build a solver with the requested nshell (same size, decoh flag, and alpha)
-            solver = CI_Lindblad(Nx=Nx, Ny=Ny, decoh=self.decoh, alpha=alpha_val, nshell=ns)
-            # Use the built-in chern dynamics routine (handles its own progress prints)
-            ts, ch, _, _ = solver.chern_dynamics_vs_time(alpha=alpha_val,
-                                                         max_steps=int(max_steps),
-                                                         keep_history=False)
-            label_ns = '∞' if ns is None else str(int(ns))
-            ax.plot(ts * dt, ch.real,
-                    label=f"nshell={label_ns}",
-                    marker=marker_cycle[i % len(marker_cycle)],
-                    markevery=mevery,
-                    lw=1.2)
+        # --- Add Chern marker inset ---
+        # Compute local Chern marker for inset
+        #C_inset = self.local_chern_marker(G)
+        # Add an inset showing tanh C(r)
+        #axins = inset_axes(ax, width="32%", height="40%", loc="upper right", borderpad=1.0)
+        #im_in = axins.imshow(C_inset, cmap='RdBu_r', vmin=-1.0, vmax=1.0, origin='upper', aspect='equal')
+        # Show ticks and labels on the inset
+        #axins.set_xlabel('y', fontsize=9)
+        #axins.set_ylabel('x', fontsize=9)
+        #axins.tick_params(axis='both', labelsize=8)
+        # Draw a light grid at lattice spacing to make the torus lattice visible
+        #Nx, Ny = int(self.Nx), int(self.Ny)
+        #axins.set_xticks(np.arange(-0.5, Ny, 1), minor=True)
+        #axins.set_yticks(np.arange(-0.5, Nx, 1), minor=True)
+        #axins.grid(which='minor', color='k', linewidth=0.2, alpha=0.25)
+        # Colorbar with legend text
+        #cbar_in = fig.colorbar(im_in, ax=axins, fraction=0.046, pad=0.04)
+        #cbar_in.set_label(r"$\tanh\mathcal{C}(\mathbf{r})$", fontsize=9)
+        #cbar_in.ax.tick_params(labelsize=8)
 
-        ax.set_xlabel("t")
-        ax.set_ylabel("real-space Chern number")
-        ax.set_title(f"Chern dynamics vs t (N={Nx}, alpha={alpha_val:g})")
-        ax.grid(True, alpha=0.3)
-        ax.legend(title="truncation")
-        plt.tight_layout()
-
-        if filename is None:
-            # Encode nshell list succinctly in the filename
-            def _ns_desc(vals):
-                out = []
-                for v in vals:
-                    out.append('inf' if v is None else str(int(v)))
-                return '-'.join(out)
-            ns_desc = _ns_desc(nshell_list)
-            decoh_tag = '_decoh_on' if self.decoh else '_decoh_off'
-            filename = f"chern_dyn_vs_time_N{Nx}_alpha{alpha_val:g}_nshells_{ns_desc}_steps{int(max_steps)}{decoh_tag}.pdf"
-
-        fullpath = os.path.join(outdir, filename)
-        plt.show()
-        fig.savefig(fullpath, bbox_inches='tight')
-        plt.close(fig)
-        return fullpath
-
-    def plot_steady_chern_vs_alpha(self, N_list=(11, 21, 31), alpha_list=None,
-                                   dt=5e-2, max_steps=500, filename=None):
-        """
-        Plot steady-state (after max_steps) Chern number vs alpha for varying N.
-
-        Parameters
-        ----------
-        N_list : iterable of int
-            System sizes (square lattices N×N).
-        alpha_list : iterable of float, optional
-            Sequence of alpha values. If None, defaults to linspace(-4, 4, 161).
-        dt : float
-            RK4 time step.
-        max_steps : int
-            Number of steps (default 500).
-        filename : str or None
-            PDF filename to save. If None, a descriptive one is generated.
-        """
-        if alpha_list is None:
-            alphas = np.linspace(-4.0, 4.0, 161)
-        else:
-            alphas = np.asarray(alpha_list, dtype=float)
-
-        outdir = self._ensure_outdir('figs/chern_vs_alpha')
-        # Start total timing
-        t_total_start = time.time()
-
-        fig, ax = plt.subplots(figsize=(7, 4.5))
-        nN = len(N_list)
-        nA = len(alphas)
-        for iN, N in enumerate(N_list, start=1):
-            ch_vals = []
-            N_start = time.time()
-            for ia, a in enumerate(alphas, start=1):
-                a_start = time.time()
-                solver = CI_Lindblad(Nx=N, Ny=N, decoh=self.decoh, alpha=a)
-                solver._ensure_evolved(dt=dt, max_steps=int(max_steps), keep_history=False)
-                ch_val = solver.real_space_chern_number(solver.G_last)
-                ch_vals.append(ch_val.real)
-                # Alpha (inner outer-loop) progress line
-                alpha_iter_time = time.time() - a_start
-                total_elapsed   = time.time() - t_total_start
-                clear_output(wait=True)
-                print(
-                    f"[steady_vs_alpha] N_iter {iN}/{nN} | alpha_iter {ia}/{nA} | "
-                    f"alpha={a:g} | N={N} | alpha_itertime={alpha_iter_time:.3e}s | total={total_elapsed:.3e}s"
-                )
-            # Optionally, report per-N block duration
-            N_time = time.time() - N_start
-            ax.plot(alphas, np.array(ch_vals), label=f"N={N}", marker = 'o')
-
-        ax.set_xlabel(r"$\alpha$")
-        ax.set_ylabel("real-space Chern number")
-        ax.set_title(f"Steady-state Chern vs $\\alpha$ (steps={int(max_steps)})")
-        ax.grid(True, alpha=0.3)
-        ax.legend()
-        plt.tight_layout()
-
-        if filename is None:
-            Ns = "-".join(str(n) for n in N_list)
-            if self.decoh:
-                filename = f"chern_steady_vs_alpha_steps{int(max_steps)}_Ns{Ns}_decoh_on.pdf"
+        # Plot correlation profiles with inline labels to the right of each curve
+        for x0 in x_positions:
+            C_vec = self.squared_two_point_corr_xslice(G, x0=int(x0), ry=ry_vals).real
+            line, = ax.plot(ry_vals, C_vec, marker='o', ms=3, lw=1, label=f"$x_0={int(x0)%Nx}$")
+            
+            # Determine a good y value at the right edge (use last finite value)
+            yvals = C_vec
+            # fallback if there are NaNs/inf at the end
+            finite = np.isfinite(yvals)
+            if np.any(finite):
+                y_right = yvals[finite][-1]
             else:
-                filename = f"chern_steady_vs_alpha_steps{int(max_steps)}_Ns{Ns}_decoh_off.pdf"
+                y_right = yvals[-1]
+
+            # Place label slightly to the right of the last x value
+            x_right = ry_vals[-1] * 1.02 if ry_vals[-1] > 0 else ry_vals[-1] + 0.5
+            ax.annotate(f"{int(x0)%Nx}", xy=(ry_vals[-1], y_right), xytext=(x_right, y_right),
+                        textcoords='data', ha='left', va='center', fontsize=9,
+                        color=line.get_color())
+
+        ax.set_xlabel(r"$r_y$")
+        ax.set_ylabel(r"$C_G(x_0; r_y)$")
+        ax.set_title(f"Squared correlator vs $r_y$ at fixed $x_0$ (N={Nx}, steps={int(max_steps)})")
+        ax.set_yscale('log')
+        ax.set_xscale('log')
+        ax.grid(True, alpha=0.3)
+        # Inset legend inside the axes (lower-left corner), multi‑column, semi‑transparent box
+        leg = ax.legend(
+            loc='lower left',
+            bbox_to_anchor=(0.02, 0.02),   # within axes: small margin from bottom-left
+            ncol=4,                        # adjust columns as desired
+            fontsize=8,
+            frameon=True,
+            framealpha=0.85,
+            borderpad=0.4,
+            handlelength=1.5,
+            handletextpad=0.6,
+            columnspacing=0.9,
+            labelspacing=0.3
+        )
+        # Ensure tight layout now that the legend is inside the axes
+        fig.tight_layout()
+        # Inline labels used instead of legend
+        # ax.legend()
+
+        # Robust filename encoding for x_positions
+        if filename is None:
+            # encode x positions briefly (support both list of ints and list of (x,label))
+            try:
+                # list of (x,label)
+                xlist = [int(x) for (x, *_) in x_positions]
+            except Exception:
+                # list/array of ints
+                xlist = [int(x) for x in x_positions]
+            xdesc = "-".join(str(int(x) % Nx) for x in xlist)
+            decoh_tag = "_decoh_on" if self.decoh else ""
+            filename = f"corr2_y_profiles_N{Nx}_xs_{xdesc}_steps{int(max_steps)}{decoh_tag}.pdf"
 
         fullpath = os.path.join(outdir, filename)
-        plt.tight_layout()
         plt.show()
-        fig.savefig(fullpath, bbox_inches='tight')
+        fig.savefig(fullpath)
         plt.close(fig)
         return fullpath
+
+    def G_CI(self, alpha=1.0, norm='backward', k_is_centered=False):
+        """
+        Real-space two-point function G = P_minus^*(r,r') for uniform alpha.
+        """
+        Nx, Ny = int(self.Nx), int(self.Ny)
+    
+        # (Re)build k-space projectors if alpha differs
+        if (self.alpha is None) or (float(alpha) != float(self.alpha)):
+            self.construct_OW_functions(float(alpha))
+    
+        def _k_to_r_rel_full(Pk):  # Pk: (Nx,Ny,2,2)
+            if k_is_centered:
+                Pk = np.fft.ifftshift(Pk, axes=(0,1))
+            PR = np.fft.ifft2(Pk, axes=(0,1), norm=norm)  # (Nx,Ny,2,2)
+            PR = np.real_if_close(PR, tol=1e3)
+    
+            x = np.arange(Nx); y = np.arange(Ny)
+            X  = x[:, None, None, None]
+            Xp = x[None, None, :, None]
+            Y  = y[None, :, None, None]
+            Yp = y[None, None, None, :]
+            dX = (X - Xp) % Nx
+            dY = (Y - Yp) % Ny
+            return PR[dX, dY, :, :]                         # (Nx,Ny,Nx,Ny,2,2)
+    
+        Pminus_rel = _k_to_r_rel_full(self.Pminus_k)        # 6D
+        G = np.moveaxis(Pminus_rel.conj(), 4, 2)            # (Nx,Ny,2,Nx,Ny,2)
+        return G
 
     def plot_squared_corr_vs_alpha(self, direction='x', alpha_list=None,
                                    dt=5e-2, max_steps=500, filename=None):
@@ -941,11 +778,36 @@ class CI_Lindblad:
 
         outdir = self._ensure_outdir('figs/corr_vs_r')
 
+        # If alphas contains a single value and we already have a cached evolution, reuse it
+        if np.size(alphas) == 1:
+            self._ensure_evolved()
+            G_final = self.G_last
+            a = float(alphas.reshape(-1)[0])
+            C_grid = self.squared_two_point_corr(G_final, rx=rx_arr, ry=ry_arr)
+            if direction == 'diag':
+                L = r_vals.size
+                C_vec = C_grid[np.arange(L), np.arange(L)].astype(float)
+            else:
+                C_vec = C_grid.reshape(-1).astype(float)
+            fig, ax = plt.subplots(figsize=(7, 4.5))
+            ax.plot(r_vals, C_vec, marker='o', ms=3, lw=1, label=f"alpha={a:g}")
+            ax.set_xlabel(r"$r$")
+            ax.set_ylabel(ylabel)
+            ax.set_title(f"Steady-state |G|$^2$ vs r along {title_dir}-path")
+            ax.set_yscale('log'); ax.grid(True, alpha=0.3); ax.legend()
+            plt.tight_layout()
+            outdir = self._ensure_outdir('figs/corr_vs_r')
+            if filename is None:
+                r_desc = f"r0-{r_vals[-1]}"
+                filename = f"corr2_1D_vs_r_dir{title_dir}_N{Nx}_{r_desc}_alpha_{a:g}.pdf"
+            fullpath = os.path.join(outdir, filename)
+            plt.show(); fig.savefig(fullpath, bbox_inches='tight'); plt.close(fig)
+            return fullpath
         fig, ax = plt.subplots(figsize=(7, 4.5))
         for a in alphas:
-            solver = CI_Lindblad(Nx=Nx, Ny=Ny, decoh=self.decoh, alpha=a)
-            solver._ensure_evolved(dt=dt, max_steps=int(max_steps), keep_history=False)
-            C_grid = solver.squared_two_point_corr(G=solver.G_last, rx=rx_arr, ry=ry_arr)
+            solver = CI_Lindblad(Nx=Nx, Ny=Ny, decoh=self.decoh, alpha_init=a)
+            G_final, _ = solver.G_evolution(max_steps=int(max_steps), dt=dt, keep_history=False)
+            C_grid = solver.squared_two_point_corr(G_final, rx=rx_arr, ry=ry_arr)
 
             if direction == 'diag':
                 # C_grid has shape (len(r), len(r)); take the diagonal entries
@@ -983,107 +845,313 @@ class CI_Lindblad:
         fig.savefig(fullpath, bbox_inches='tight')
         plt.close(fig)
         return fullpath
-
-    # -----------------------------
-    # Pretty scatter-plotter (amp→size, phase→color) for a chosen center
-    # -----------------------------
-    def plot_wanniers(self, R=(0, 0), alpha=None, nshell = None, size_max=450, gamma=0.8,
-                      cmap='hsv', figsize=(12, 6), savepath=None, show=True):
+    
+    def local_chern_marker(self, G=None, mask_outside=False):
         """
-        Visualize the four overcomplete Wannier spinors W_{ν,±}(r, μ; R) at a chosen center R=(Rx,Ry)
-        as scatter plots: point size encodes amplitude, color encodes phase.
+        Local Chern marker C(r) (Bianco–Resta) using *non-modular* coordinates.
+        Here (x,y) run 1..Nx and 1..Ny (1-based), i.e. X=1..Nx, Y=1..Ny multiply
+        the right-hand real-space indices directly.
 
         Parameters
         ----------
-        R : tuple(int,int)
-            Center (Rx,Ry) at which to display the Wannier functions. 0-based indices on the torus.
-        alpha : float or None
-            If provided and different from self.alpha, rebuild the OW functions for this alpha.
-        nshell : positive integer < min(Nx, Ny)
-            Define square truncation window about Wannier center
-        size_max : float
-            Max scatter marker size (points^2).
-        gamma : float
-            Nonlinearity for size scaling: size ∝ (|W|/max|W|)^gamma.
-        cmap : str or Colormap
-            Colormap for phase (default 'hsv').
-        figsize : tuple
-            Figure size passed to plt.subplots.
-        savepath : str or None
-            If given, save the figure to this path.
-        show : bool
-            If True (default), display the figure with plt.show().
+        G : ndarray or None
+            Two-point function with shape (Nx, Ny, 2, Nx, Ny, 2). If None, uses
+            the cached steady-state `self.G_last`.
+        mask_outside : bool
+            If True, zero out values outside `self.inside_mask` (for visualization
+            inside the tri-partition disk).
 
         Returns
         -------
-        fig, axes : Matplotlib Figure and Axes array
+        C_tanh : ndarray, shape (Nx, Ny)
+            tanh of the local Chern marker.
+        """
+        if G is None:
+            self._ensure_evolved()
+            G = self.G_last
+
+        P = np.asarray(G.conj())
+        Nx, Ny, s1, Nx2, Ny2, s2 = P.shape
+        if (s1, s2) != (2, 2) or (Nx, Ny) != (Nx2, Ny2):
+            raise ValueError("G must have shape (Nx, Ny, 2, Nx, Ny, 2).")
+
+        # --- Non-modular 1-based coordinates: X=1..Nx, Y=1..Ny ---
+        X = np.arange(1, Nx + 1, dtype=float)
+        Y = np.arange(1, Ny + 1, dtype=float)
+        Xgrid, Ygrid = np.meshgrid(X, Y, indexing='ij')
+
+        # Multiply by X or Y on the right real-space indices (x',y') of the kernel
+        def right_X(A):  return A * Xgrid[None, None, None, :, :, None]
+        def right_Y(A):  return A * Ygrid[None, None, None, :, :, None]
+
+        # Contraction over shared (x',y',s')
+        def mm(A, B):    return np.einsum('ijslmn,lmnopr->ijsopr', A, B, optimize=True)
+
+        # Ordered products
+        T = right_X(P); T = mm(T, P); T = right_Y(T); T = mm(T, P)  # G X G Y G
+        U = right_Y(P); U = mm(U, P); U = right_X(U); U = mm(U, P)  # G Y G X G
+        M = (2.0 * np.pi * 1j) * (T - U)
+
+        # Diagonal (x,y,μ; x,y,μ), sum over μ
+        ix = np.arange(Nx)[:, None, None]
+        iy = np.arange(Ny)[None, :, None]
+        ispin = np.arange(2)[None, None, :]
+        diag_vals = M[ix, iy, ispin, ix, iy, ispin]  # (Nx,Ny,2)
+        C = diag_vals.sum(axis=2)                    # (Nx,Ny)
+
+        C = np.tanh(np.real_if_close(C, tol=1e-9))
+        if mask_outside:
+            C = np.where(self.inside_mask, C, 0.0)
+        return C    
+
+
+    def chern_marker_dynamics(self, dt=5e-2, max_steps=250, n_a=0.5,
+                              G_init=None, fps=12, cmap='RdBu_r',
+                              outbasename=None, vmin=-1.0, vmax=1.0):
+        """
+        Animate the local Chern marker C(r) over time using the cached evolution history
+        if available; otherwise, perform a short evolution to generate the frames.
+        Saves a GIF and also saves a static final frame as a PDF image.
+        Returns the paths to both the GIF and the final image, as well as the final arrays.
+
+        Parameters
+        ----------
+        dt : float
+            RK4 time step.
+        max_steps : int
+            Number of RK4 steps.
+        n_a : float
+            Parameter forwarded to Lcycle.
+        G_init : ndarray or None
+            Optional initial state for G; otherwise zeros.
+        fps : int
+            Frames per second of the output GIF.
+        cmap : str
+            Matplotlib colormap for the heatmap.
+        outbasename : str or None
+            Base file name (without extension). If None, a descriptive one is used.
+        vmin, vmax : float
+            Color scale limits for the marker plot.
+
+        Returns
+        -------
+        gif_path : str
+            Full path to the saved GIF.
+        final_path : str
+            Full path to the saved static final frame (PDF).
+        C_last : ndarray, shape (Nx, Ny)
+            Chern marker of the final step.
+        G : ndarray
+            Final G after evolution.
         """
         Nx, Ny = int(self.Nx), int(self.Ny)
-        Rx, Ry = R
 
-        # Rebuild if alpha requested is different from current
-        if alpha is None:
-            alpha = self.alpha
-        
-        self.construct_OW_functions(alpha, nshell)
+        # Ensure Lindbladian ingredients exist
+        self._ensure_OW_ready(alpha_hint=1.0)
 
-        # The constructor stores W_* with shape (Nx, Ny, 2, Nx, Ny), axes (x,y,μ,Rx,Ry).
-        # Slice out the chosen center (Rx,Ry), leaving (Nx,Ny,2).
-        W_A_minus = self.W_A_minus[:, :, :, Rx, Ry]  # (Nx,Ny,2)
-        W_B_minus = self.W_B_minus[:, :, :, Rx, Ry]
-        W_A_plus  = self.W_A_plus[:,  :, :, Rx, Ry]
-        W_B_plus  = self.W_B_plus[:,  :, :, Rx, Ry]
 
-        # fftshift each component so the chosen center appears visually centered.
-        fftshift = np.fft.fftshift
-        panels = [
-            (fftshift(W_A_minus[:, :, 0]), r'$W_{R,A,-}(\mathbf{r},1)$', 'a'),
-            (fftshift(W_B_minus[:, :, 0]), r'$W_{R,B,-}(\mathbf{r},1)$', 'b'),
-            (fftshift(W_A_plus [:, :, 0]), r'$W_{R,A,+}(\mathbf{r},1)$', 'c'),
-            (fftshift(W_B_plus [:, :, 0]), r'$W_{R,B,+}(\mathbf{r},1)$', 'd'),
-            (fftshift(W_A_minus[:, :, 1]), r'$W_{R,A,-}(\mathbf{r},2)$', 'e'),
-            (fftshift(W_B_minus[:, :, 1]), r'$W_{R,B,-}(\mathbf{r},2)$', 'f'),
-            (fftshift(W_A_plus [:, :, 1]), r'$W_{R,A,+}(\mathbf{r},2)$', 'g'),
-            (fftshift(W_B_plus [:, :, 1]), r'$W_{R,B,+}(\mathbf{r},2)$', 'h'),
-        ]
+        # Where to save
+        outdir = self._ensure_outdir('figs/chern_marker')
+        if outbasename is None:
+            decoh_tag = 'decoh_on' if self.decoh else 'decoh_off'
+            outbasename = f"chern_marker_dynamics_N{Nx}_steps{int(max_steps)}_{decoh_tag}"
+        gif_path = os.path.join(outdir, outbasename + ".gif")
 
-        # Coordinates centered about zero for a nicer view
-        xs = np.arange(Nx) - Nx // 2
-        ys = np.arange(Ny) - Ny // 2
-        X, Y = np.meshgrid(xs, ys, indexing='ij')
+        # --- Set up compact figure/axes like the reference frame ---
+        # Small square panel with room for a horizontal colorbar above.
+        fig = plt.figure(figsize=(3.2, 3.8))
+        # Main image axes
+        ax = fig.add_axes([0.12, 0.10, 0.78, 0.78])  # [left, bottom, width, height]
+        im = ax.imshow(np.zeros((Nx, Ny)), cmap=cmap, vmin=vmin, vmax=vmax, origin='upper', aspect='equal')
 
-        fig, axes = plt.subplots(2, 4, figsize=figsize, constrained_layout=True)
-        norm = plt.Normalize(vmin=-np.pi, vmax=np.pi)
-        cmap_obj = plt.get_cmap(cmap) if isinstance(cmap, str) else cmap
+        # Style: thick black border; no axis labels or ticks
+        for spine in ax.spines.values():
+            spine.set_linewidth(1.5)
+            spine.set_color('black')
+        # Show labeled ticks and a light lattice grid
+        ax.set_xlabel("y")
+        ax.set_ylabel("x")
+        # Major ticks every 5 (adjust step if you like)
+        ax.set_xticks(np.arange(0, Ny, max(1, Ny//10)))
+        ax.set_yticks(np.arange(0, Nx, max(1, Nx//10)))
+        ax.tick_params(axis='both', labelsize=8)
+        # Minor ticks at every cell boundary to draw the lattice grid
+        ax.set_xticks(np.arange(-0.5, Ny, 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, Nx, 1), minor=True)
+        ax.grid(which='minor', color='k', linewidth=0.2, alpha=0.25)
 
-        for ax, (W, title, letter) in zip(axes.flat, panels):
-            amp = np.abs(W)
-            max_amp = amp.max() + 1e-15
-            sizes = (amp / max_amp)**gamma * size_max
-            phase = np.angle(W)
+        # Horizontal colorbar above the panel with ticks at -1, 0, 1 and text on the left
+        cax = fig.add_axes([0.32, 0.90, 0.36, 0.06])  # a small bar above the image
+        cbar = fig.colorbar(im, cax=cax, orientation='horizontal', ticks=[-1, 0, 1])
+        # Put a LaTeX-like label to the left of the colorbar
+        fig.text(0.70, 0.91, r"$\tanh\mathcal{C}(\mathbf{r})$", fontsize=12)
 
-            ax.scatter(X.ravel(), Y.ravel(), c=phase.ravel(), s=sizes.ravel(),
-                       cmap=cmap_obj, norm=norm, linewidths=0, alpha=0.95)
-            ax.set_aspect('equal', adjustable='box')
-            ax.set_xticks([]); ax.set_yticks([])
-            ax.set_title(title, fontsize=12)
-            ax.text(0.04, 0.94, f'({letter})', transform=ax.transAxes,
-                    ha='left', va='top', fontsize=12)
 
-        sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap_obj)
-        cbar = fig.colorbar(sm, ax=axes.ravel().tolist(), shrink=0.9)
-        cbar.set_label('Phase', fontsize=11)
-        cbar.set_ticks([-np.pi, 0, np.pi])
-        cbar.set_ticklabels([r'$-\pi$', r'$0$', r'$\pi$'])
+        # Initialize with zeros to guarantee a first frame
+        C = np.zeros((Nx, Ny))
+        im.set_data(C)
 
-        # Optional save
-        if savepath is not None:
-            # Ensure parent directory exists
-            os.makedirs(os.path.dirname(savepath) or ".", exist_ok=True)
-            fig.savefig(savepath, bbox_inches='tight')
+        writer = animation.PillowWriter(fps=fps)
 
-        if show:
-            plt.show()
+        # Timing
+        t_start = time.time()
+        # Use precomputed history if available; otherwise fall back to a quick evolution
+        if hasattr(self, "G_history") and len(self.G_history) > 0:
+            history = self.G_history
+            G = self.G_last
         else:
-            plt.close(fig)
-        return fig, axes
+            # Fallback: perform a short evolution to get frames
+            G_tmp, G_hist_tmp = self.G_evolution(max_steps=int(max_steps), dt=dt, keep_history=True)
+            history = G_hist_tmp
+            G = history[-1]
+
+        with writer.saving(fig, gif_path, dpi=120):
+            writer.grab_frame()
+            for step, G_frame in enumerate(history, start=1):
+                t0 = time.time()
+                C = self.local_chern_marker(G_frame)
+                im.set_data(C)
+                writer.grab_frame()
+
+                iter_time = time.time() - t0
+                clear_output(wait=True)
+                print(f"[chern_marker_dynamics] frame {step}/{len(history)} | "
+                      f"proc={iter_time:.3e}s | total={time.time()-t_start:.3e}s | "
+                      f"N=({Nx},{Ny}) | decoh={self.decoh}")
+
+        plt.close(fig)
+
+        # Final arrays to return
+        C_last = np.round(C, decimals = 2)
+
+        # Save static final frame (same styling as GIF frame)
+        final_path = os.path.join(outdir, outbasename + "_final.pdf")
+        fig2 = plt.figure(figsize=(3.2, 3.8))
+        ax2 = fig2.add_axes([0.12, 0.10, 0.78, 0.78])
+        im2 = ax2.imshow(C_last, cmap=cmap, vmin=vmin, vmax=vmax, origin='upper', aspect='equal')
+        for spine in ax2.spines.values():
+            spine.set_linewidth(1.5)
+            spine.set_color('black')
+        ax2.set_xlabel("y")
+        ax2.set_ylabel("x")
+        ax2.set_xticks(np.arange(0, Ny, max(1, Ny//10)))
+        ax2.set_yticks(np.arange(0, Nx, max(1, Nx//10)))
+        ax2.tick_params(axis='both', labelsize=8)
+        ax2.set_xticks(np.arange(-0.5, Ny, 1), minor=True)
+        ax2.set_yticks(np.arange(-0.5, Nx, 1), minor=True)
+        ax2.grid(which='minor', color='k', linewidth=0.2, alpha=0.25)
+
+        cax2 = fig2.add_axes([0.32, 0.90, 0.36, 0.06])
+        cbar2 = fig2.colorbar(im2, cax=cax2, orientation='horizontal', ticks=[-1, 0, 1])
+        fig2.text(0.70, 0.91, r"$\tanh\mathcal{C}(\mathbf{r})$", fontsize=12)
+
+        fig2.savefig(final_path)
+        plt.show()
+        plt.close(fig2)
+
+        # --- plot and save steady-state line cut: tanh C(x, y=0) vs x ---
+        final_cut_path = os.path.join(outdir, outbasename + "_final_y0_linecut.pdf")
+        fig3 = plt.figure(figsize=(3.2, 3.0))
+        ax3 = fig3.add_axes([0.15, 0.18, 0.80, 0.72])
+
+        x_vals = np.arange(Nx)
+        y0_cut = C_last[:, 0]  # y = 0 column; first index is x (rows), second is y (cols)
+        ax3.plot(x_vals, y0_cut, marker='o', ms=4, lw=1)
+
+        ax3.set_xlabel("x")
+        ax3.set_ylabel(r"$\tanh\,\mathcal{C}(x,y\!=\!0)$")
+        ax3.grid(True, alpha=0.3)
+
+        fig3.savefig(final_cut_path)
+        plt.show()
+        plt.close(fig3)
+
+        return gif_path, final_path, C_last, G
+
+
+    def plot_spectrum_vs_nshell(self, nshell_list=(None, 1, 2, 3), alpha=None,
+                                 dt=5e-2, max_steps=250, filename=None):
+        """
+        Compute and plot the spectrum (eigenvalues) of the steady-state two-point
+        function G for a fixed system size (self.Nx,self.Ny) and fixed alpha,
+        comparing different truncations nshell \in {1,2,3,\infty} (\infty ≡ None).
+
+        For each nshell, we build a CI_Lindblad with the same (Nx,Ny,decoh,alpha),
+        evolve to `max_steps`, then diagonalize the Hermitian matrix
+            G_H = (G + G^\dagger)/2
+        where G is reshaped to a (2*Nx*Ny, 2*Nx*Ny) operator. We plot the sorted
+        eigenvalues versus their index, using distinct markers for different nshell.
+
+        Parameters
+        ----------
+        nshell_list : iterable of int or None
+            Sequence of truncation radii to compare. Use None to denote no truncation (∞).
+        alpha : float or None
+            Mass parameter. If None, use self.alpha.
+        dt : float
+            RK4 time step used in evolution.
+        max_steps : int
+            Number of RK4 steps.
+        filename : str or None
+            If None, a descriptive filename is generated under figs/spectrum_nshell/.
+
+        Returns
+        -------
+        fullpath : str
+            Full path to the saved PDF.
+        """
+        Nx, Ny = int(self.Nx), int(self.Ny)
+        alpha_val = float(self.alpha if alpha is None else alpha)
+
+        outdir = self._ensure_outdir('figs/spectrum_nshell')
+        fig, ax = plt.subplots(figsize=(7.5, 5.0))
+
+        marker_cycle = ['o', 's', 'x', '^', 'D', '*', 'P']
+
+        for i, ns in enumerate(nshell_list):
+            # Build solver with given truncation
+            #solver = CI_Lindblad(Nx=Nx, Ny=Ny, decoh=self.decoh, alpha_init=alpha_val, nshell=ns)
+            # Evolve once; use cached result inside the instance
+            #solver._ensure_evolved()
+            self.construct_OW_functions(alpha = alpha_val, nshell = ns)
+            G, _ = self.G_evolution(max_steps = max_steps, dt = dt)
+
+            # Flatten G to matrix and symmetrize to ensure Hermiticity
+            Ntot = 2*Nx*Ny
+            Gm = G.reshape(Ntot, Ntot)
+
+            # Diagonalize
+            evals, _ = np.linalg.eigh(Gm)
+            evals.sort()
+
+            idx = np.arange(Ntot)
+            label_ns = '∞' if ns is None else str(int(ns))
+            ax.plot(idx, evals.real,
+                    marker=marker_cycle[i % len(marker_cycle)],
+                    markevery=max(1, Ntot // 64),
+                    lw=1.0, ms=3,
+                    label=f"nshell={label_ns}", linestyle = '')
+
+        ax.set_xlabel("eigenvalue index")
+        ax.set_ylabel("eigenvalue of G")
+        ax.set_title(f"Spectrum of G vs nshell (N={Nx}, alpha={alpha_val:g}, steps={int(max_steps)})")
+        ax.grid(True, which='both', alpha=0.3)
+        ax.legend(title="truncation", loc='best', ncol=1)
+        plt.tight_layout()
+
+        if filename is None:
+            def _ns_desc(vals):
+                out = []
+                for v in vals:
+                    out.append('inf' if v is None else str(int(v)))
+                return '-'.join(out)
+            ns_desc = _ns_desc(nshell_list)
+            decoh_tag = '_decoh_on' if self.decoh else '_decoh_off'
+            filename = f"spectrum_G_vs_nshell_N{Nx}_alpha{alpha_val:g}_nshells_{ns_desc}_steps{int(max_steps)}{decoh_tag}.pdf"
+
+        fullpath = os.path.join(outdir, filename)
+        plt.show()
+        fig.savefig(fullpath, bbox_inches='tight')
+        plt.close(fig)
+        return fullpath
+   
