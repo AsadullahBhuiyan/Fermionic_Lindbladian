@@ -5,7 +5,6 @@ import os
 import matplotlib.animation as animation
 from IPython.display import clear_output
 from matplotlib import pyplot as plt
-from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
 class CI_Lindblad_DW:
     def __init__(self, Nx, Ny, decoh=True, alpha_init=1.0, nshell=None, DW=True, dt_init=5e-2, max_steps_init=250, n_a_init=0.5, keep_history_init=True, G_init=None):
@@ -130,6 +129,7 @@ class CI_Lindblad_DW:
             # Python slices are end-exclusive; include the right edge by +1, then clamp
             x1 = min(self.Nx, half + w + 1)
             alpha[x0:x1, :] = 1  # inside slab (Chern=1)
+            print(f"DWs at x=({int(x0)}, {int(x1-1)})")
             self.alpha = alpha
         else:
             alpha = np.ones((self.Nx, self.Ny))
@@ -635,7 +635,7 @@ class CI_Lindblad_DW:
             #    (x_wall_L, "wall (L)"),
             #    (x_wall_R, "wall (R)"),
             #]
-            x_positions = np.arange(4, 16)
+            x_positions = np.arange(4, 27)
 
         # Plot
         outdir = self._ensure_outdir('figs/corr_y_profiles')
@@ -643,35 +643,68 @@ class CI_Lindblad_DW:
 
         # --- Add Chern marker inset ---
         # Compute local Chern marker for inset
-        C_inset = self.local_chern_marker(G)
+        #C_inset = self.local_chern_marker(G)
         # Add an inset showing tanh C(r)
-        axins = inset_axes(ax, width="32%", height="40%", loc="upper right", borderpad=1.0)
-        im_in = axins.imshow(C_inset, cmap='RdBu_r', vmin=-1.0, vmax=1.0, origin='upper', aspect='equal')
+        #axins = inset_axes(ax, width="32%", height="40%", loc="upper right", borderpad=1.0)
+        #im_in = axins.imshow(C_inset, cmap='RdBu_r', vmin=-1.0, vmax=1.0, origin='upper', aspect='equal')
         # Show ticks and labels on the inset
-        axins.set_xlabel('y', fontsize=9)
-        axins.set_ylabel('x', fontsize=9)
-        axins.tick_params(axis='both', labelsize=8)
+        #axins.set_xlabel('y', fontsize=9)
+        #axins.set_ylabel('x', fontsize=9)
+        #axins.tick_params(axis='both', labelsize=8)
         # Draw a light grid at lattice spacing to make the torus lattice visible
-        Nx, Ny = int(self.Nx), int(self.Ny)
-        axins.set_xticks(np.arange(-0.5, Ny, 1), minor=True)
-        axins.set_yticks(np.arange(-0.5, Nx, 1), minor=True)
-        axins.grid(which='minor', color='k', linewidth=0.2, alpha=0.25)
+        #Nx, Ny = int(self.Nx), int(self.Ny)
+        #axins.set_xticks(np.arange(-0.5, Ny, 1), minor=True)
+        #axins.set_yticks(np.arange(-0.5, Nx, 1), minor=True)
+        #axins.grid(which='minor', color='k', linewidth=0.2, alpha=0.25)
         # Colorbar with legend text
-        cbar_in = fig.colorbar(im_in, ax=axins, fraction=0.046, pad=0.04)
-        cbar_in.set_label(r"$\tanh\mathcal{C}(\mathbf{r})$", fontsize=9)
-        cbar_in.ax.tick_params(labelsize=8)
+        #cbar_in = fig.colorbar(im_in, ax=axins, fraction=0.046, pad=0.04)
+        #cbar_in.set_label(r"$\tanh\mathcal{C}(\mathbf{r})$", fontsize=9)
+        #cbar_in.ax.tick_params(labelsize=8)
 
-        # Plot correlation profiles
+        # Plot correlation profiles with inline labels to the right of each curve
         for x0 in x_positions:
-            C_vec = self.squared_two_point_corr_xslice(G, x0=int(x0), ry=ry_vals)
-            ax.plot(ry_vals, C_vec.real, marker='o', ms=3, lw=1, label=f"(x={int(x0)%Nx})")
+            C_vec = self.squared_two_point_corr_xslice(G, x0=int(x0), ry=ry_vals).real
+            line, = ax.plot(ry_vals, C_vec, marker='o', ms=3, lw=1, label=f"$x_0={int(x0)%Nx}$")
+            
+            # Determine a good y value at the right edge (use last finite value)
+            yvals = C_vec
+            # fallback if there are NaNs/inf at the end
+            finite = np.isfinite(yvals)
+            if np.any(finite):
+                y_right = yvals[finite][-1]
+            else:
+                y_right = yvals[-1]
+
+            # Place label slightly to the right of the last x value
+            x_right = ry_vals[-1] * 1.02 if ry_vals[-1] > 0 else ry_vals[-1] + 0.5
+            ax.annotate(f"{int(x0)%Nx}", xy=(ry_vals[-1], y_right), xytext=(x_right, y_right),
+                        textcoords='data', ha='left', va='center', fontsize=9,
+                        color=line.get_color())
 
         ax.set_xlabel(r"$r_y$")
         ax.set_ylabel(r"$C_G(x_0; r_y)$")
         ax.set_title(f"Squared correlator vs $r_y$ at fixed $x_0$ (N={Nx}, steps={int(max_steps)})")
         ax.set_yscale('log')
+        ax.set_xscale('log')
         ax.grid(True, alpha=0.3)
-        ax.legend()
+        # Inset legend inside the axes (lower-left corner), multi‑column, semi‑transparent box
+        leg = ax.legend(
+            loc='lower left',
+            bbox_to_anchor=(0.02, 0.02),   # within axes: small margin from bottom-left
+            ncol=4,                        # adjust columns as desired
+            fontsize=8,
+            frameon=True,
+            framealpha=0.85,
+            borderpad=0.4,
+            handlelength=1.5,
+            handletextpad=0.6,
+            columnspacing=0.9,
+            labelspacing=0.3
+        )
+        # Ensure tight layout now that the legend is inside the axes
+        fig.tight_layout()
+        # Inline labels used instead of legend
+        # ax.legend()
 
         # Robust filename encoding for x_positions
         if filename is None:
@@ -877,58 +910,45 @@ class CI_Lindblad_DW:
         plt.close(fig)
         return fullpath
     
-    def local_chern_marker(self, G=None, origin=None, mask_outside=False):
+    def local_chern_marker(self, G=None, mask_outside=False):
         """
-        Local Chern marker C(r) (Bianco–Resta) for a GS projector, using modular
-        (wrapped) coordinates compatible with periodic boundary conditions to
-        avoid artificial seams.
+        Local Chern marker C(r) (Bianco–Resta) using *non-modular* coordinates.
+        Here (x,y) run 1..Nx and 1..Ny (1-based), i.e. X=1..Nx, Y=1..Ny multiply
+        the right-hand real-space indices directly.
 
         Parameters
         ----------
         G : ndarray or None
-            Two-point function with shape (Nx, Ny, 2, Nx, Ny, 2). If None, use
+            Two-point function with shape (Nx, Ny, 2, Nx, Ny, 2). If None, uses
             the cached steady-state `self.G_last`.
-        origin : (int,int) or None
-            Lattice site to place the coordinate origin. The coordinate seam is
-            opposite this point. If None, uses `self.ref` set at init.
         mask_outside : bool
-            If True, zero out values outside `self.inside_mask` (useful for
-            visualization inside the tri-partition disk).
+            If True, zero out values outside `self.inside_mask` (for visualization
+            inside the tri-partition disk).
 
         Returns
         -------
         C_tanh : ndarray, shape (Nx, Ny)
-            tanh of the local Chern marker on the torus.
+            tanh of the local Chern marker.
         """
         if G is None:
             self._ensure_evolved()
             G = self.G_last
+
         P = np.asarray(G.conj())
         Nx, Ny, s1, Nx2, Ny2, s2 = P.shape
         if (s1, s2) != (2, 2) or (Nx, Ny) != (Nx2, Ny2):
             raise ValueError("G must have shape (Nx, Ny, 2, Nx, Ny, 2).")
 
-        # --- modular coordinates on the torus ---
-        def modular_coords(N, origin_idx):
-            c = np.arange(N, dtype=float) - float(origin_idx)
-            c = (c + N/2) % N - N/2  # in (-N/2, N/2]
-            return c
-
-        if origin is None:
-            x0, y0 = self.ref
-        else:
-            x0, y0 = int(origin[0]) % Nx, int(origin[1]) % Ny
-
-        X = modular_coords(Nx, x0)
-        Y = modular_coords(Ny, y0)
+        # --- Non-modular 1-based coordinates: X=1..Nx, Y=1..Ny ---
+        X = np.arange(1, Nx + 1, dtype=float)
+        Y = np.arange(1, Ny + 1, dtype=float)
         Xgrid, Ygrid = np.meshgrid(X, Y, indexing='ij')
 
-        # Helpers: multiply by X or Y on left / right real-space indices
-        def left_X(A):   return Xgrid[:, :, None, None, None] * A
+        # Multiply by X or Y on the right real-space indices (x',y') of the kernel
         def right_X(A):  return A * Xgrid[None, None, None, :, :, None]
-        def left_Y(A):   return Ygrid[:, :, None, None, None] * A
         def right_Y(A):  return A * Ygrid[None, None, None, :, :, None]
 
+        # Contraction over shared (x',y',s')
         def mm(A, B):    return np.einsum('ijslmn,lmnopr->ijsopr', A, B, optimize=True)
 
         # Ordered products
@@ -936,6 +956,7 @@ class CI_Lindblad_DW:
         U = right_Y(P); U = mm(U, P); U = right_X(U); U = mm(U, P)  # G Y G X G
         M = (2.0 * np.pi * 1j) * (T - U)
 
+        # Diagonal (x,y,μ; x,y,μ), sum over μ
         ix = np.arange(Nx)[:, None, None]
         iy = np.arange(Ny)[None, :, None]
         ispin = np.arange(2)[None, None, :]
@@ -945,7 +966,7 @@ class CI_Lindblad_DW:
         C = np.tanh(np.real_if_close(C, tol=1e-9))
         if mask_outside:
             C = np.where(self.inside_mask, C, 0.0)
-        return C
+        return C    
 
 
     def chern_marker_dynamics(self, dt=5e-2, max_steps=250, n_a=0.5,
@@ -1041,10 +1062,12 @@ class CI_Lindblad_DW:
         # Use precomputed history if available; otherwise fall back to a quick evolution
         if hasattr(self, "G_history") and len(self.G_history) > 0:
             history = self.G_history
+            G = self.G_last
         else:
             # Fallback: perform a short evolution to get frames
             G_tmp, G_hist_tmp = self.G_evolution(max_steps=int(max_steps), dt=dt, keep_history=True)
             history = G_hist_tmp
+            G = history[-1]
 
         with writer.saving(fig, gif_path, dpi=120):
             writer.grab_frame()
